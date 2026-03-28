@@ -1,0 +1,22 @@
+defmodule LemonSkills.Application do
+  @moduledoc false
+
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    # Ensure ~/.lemon/agent/skill exists before the registry loads from disk.
+    LemonSkills.Config.ensure_dirs!()
+    # Copy repo-bundled skills into the user's global config dir if missing.
+    LemonSkills.BuiltinSeeder.seed!()
+
+    children = [
+      LemonSkills.Registry,
+      # MCP source for external tool discovery
+      {LemonSkills.McpSource, []}
+    ]
+
+    opts = [strategy: :one_for_one, name: LemonSkills.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+end

@@ -1,0 +1,201 @@
+[providers.anthropic]
+api_key = "sk-ant-your-api-key-here"
+
+[providers.openai]
+api_key = "sk-your-openai-key-here"
+
+[providers.opencode]
+api_key = "opencode-your-api-key-here"
+base_url = "https://opencode.ai/zen/v1"
+
+[providers.kimi]
+api_key = "sk-kimi-your-kimi-key-here"
+base_url = "https://api.kimi.com/coding/"
+
+[providers.google]
+api_key = "your-google-api-key-here"
+
+[defaults]
+provider = "anthropic"
+model = "claude-sonnet-4-20250514"
+thinking_level = "medium"
+engine = "lemon"
+
+[runtime]
+theme = "default"
+extension_paths = []
+
+[runtime.compaction]
+enabled = true
+reserve_tokens = 16384
+keep_recent_tokens = 20000
+
+[runtime.retry]
+enabled = true
+max_retries = 3
+base_delay_ms = 1000
+
+[runtime.cli.codex]
+extra_args = ["-c", "notify=[]"]
+# Local main sessions default to auto-approve when this is unset.
+auto_approve = true
+
+[runtime.cli.claude]
+dangerously_skip_permissions = true
+# yolo = false
+# allowed_tools = []
+# scrub_env = false
+# env_allowlist = []
+# env_allow_prefixes = []
+
+[runtime.cli.opencode]
+# model = ""
+
+[runtime.cli.pi]
+# extra_args = []
+# model = ""
+# provider = ""
+
+[runtime.cli.kimi]
+extra_args = []
+
+[tui]
+theme = "lemon"
+debug = false
+
+[gateway]
+max_concurrent_runs = 2
+default_engine = "lemon"
+# Optional fallback working directory for unbound chats/sessions.
+# If omitted, Lemon defaults to your home directory.
+default_cwd = "~/"
+auto_resume = false
+enable_telegram = false
+enable_discord = false
+enable_email = false
+enable_farcaster = false
+enable_webhook = false
+enable_xmtp = false
+require_engine_lock = true
+engine_lock_timeout_ms = 60000
+
+[gateway.queue]
+mode = "collect"
+cap = 50
+drop = "oldest"
+
+[gateway.telegram]
+bot_token = "123456:token"
+allowed_chat_ids = [12345678]
+poll_interval_ms = 1000
+edit_throttle_ms = 1000
+debounce_ms = 1000
+allow_queue_override = false
+account_id = "default"
+offset = 0
+drop_pending_updates = false
+
+[gateway.xmtp]
+# XMTP network: production | dev | local
+env = "production"
+# Optional custom API URL (leave unset for SDK defaults)
+# api_url = "https://api.xmtp.network"
+# Bot wallet credentials (prefer secret refs; env fallback still works)
+wallet_address = "${XMTP_WALLET_ADDRESS}"
+wallet_key_secret = "XMTP_WALLET_KEY"
+# Optional explicit inbox id (typically discovered by SDK)
+# inbox_id = ""
+# Local SDK storage path
+db_path = "~/.lemon/xmtp-db"
+# Poll cadence for inbound messages
+poll_interval_ms = 1500
+# Fail readiness if live mode is unavailable
+require_live = true
+# Max time to wait for bridge connect before marking unavailable
+connect_timeout_ms = 15000
+# Set true only for local development without live XMTP
+mock_mode = false
+
+[gateway.projects.example]
+root = "/path/to/project"
+default_engine = "lemon"
+
+[[gateway.bindings]]
+transport = "telegram"
+chat_id = 12345678
+topic_id = 0
+project = "example"
+default_engine = "lemon"
+queue_mode = "collect"
+
+[gateway.engines.lemon]
+cli_path = "lemon"
+enabled = true
+
+[mesh]
+trusted_peers = []
+replication_poll_interval_ms = 1000
+replication_batch_limit = 200
+snapshot_scope = "mesh_state"
+lease_ttl_ms = 60000
+
+# --- Logging ---
+
+# [logging]
+# file = ""
+# level = "info"
+# max_no_bytes = 10485760
+# max_no_files = 5
+# compress_on_rotate = true
+
+# --- Web Tool Configuration ---
+
+# [runtime.tools.web.search]
+# enabled = true
+# provider = "brave"      # "brave" | "perplexity"
+# max_results = 5
+# timeout_seconds = 30
+# cache_ttl_minutes = 15
+
+# [runtime.tools.web.search.perplexity]
+# api_key = "pplx-..."
+# model = "perplexity/sonar-pro"
+
+# [runtime.tools.web.fetch]
+# enabled = true
+# max_chars = 50000
+# timeout_seconds = 30
+
+# [runtime.tools.web.fetch.firecrawl]
+# enabled = true
+# api_key = "fc-..."
+
+# --- WASM Tool Configuration ---
+
+# [runtime.tools.wasm]
+# enabled = false
+# auto_build = true
+# tool_paths = []
+# default_memory_limit = 10485760
+# default_timeout_ms = 60000
+
+# --- Discord Configuration ---
+
+# [gateway.discord]
+# bot_token = ""
+# allowed_guild_ids = []
+# allowed_channel_ids = []
+# deny_unbound_channels = false
+
+# --- Profiles ---
+
+[profiles.default]
+name = "Default Agent"
+# description = ""
+# model = ""
+# system_prompt = ""
+
+# [profiles.default.tool_policy]
+# allow = "all"
+# deny = []
+# require_approval = ["bash", "write", "edit"]

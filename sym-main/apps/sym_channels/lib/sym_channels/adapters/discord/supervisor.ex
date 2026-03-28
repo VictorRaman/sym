@@ -1,0 +1,50 @@
+defmodule LemonChannels.Adapters.Discord.Supervisor do
+  @moduledoc """
+  Supervisor for Discord adapter processes.
+  """
+
+  use Supervisor
+
+  alias LemonCore.Secrets
+
+  def start_link(opts \\ []) do
+    Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @impl true
+  def init(opts) do
+    base = LemonChannels.GatewayConfig.get(:discord, %{}) || %{}
+
+    config =
+      base
+      |> merge_config(Keyword.get(opts, :config))
+
+    token = config[:bot_token] || config["bot_token"] || resolve_bot_token_secret(config) || resolve_token()
+
+    children =
+      if is_binary(token) and String.trim(token) != "" do
+        [{LemonChannels.Adapters.Discord.Transport, [config: config]}]
+      else
+        []
+      end
+
+    Supervisor.init(children, strategy: :one_for_one)
+  end
+
+  defp merge_config(base, opts), do: LemonCore.MapHelpers.merge_config(base, opts)
+
+  defp resolve_bot_token_secret(config) do
+    secret_name = config[:bot_token_secret] || config["bot_token_secret"]
+
+    if is_binary(secret_name) and secret_name != "" do
+      Secrets.fetch_value(secret_name)
+    else
+      nil
+    end
+  end
+
+  defp resolve_token do
+    # Try secrets store first, then fall back to environment variable
+    Secrets.fetch_value("DISCORD_BOT_TOKEN") || System.get_env("DISCORD_BOT_TOKEN")
+  end
+end

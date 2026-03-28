@@ -1,0 +1,3872 @@
+defmodule LemonChannels.Adapters.Telegram.Transport do
+  @moduledoc """
+  Telegram polling transport that normalizes messages and forwards them to the router.
+  """
+
+  use GenServer
+
+  require Logger
+
+  alias LemonChannels.BindingResolver
+  alias LemonChannels.Cwd
+  alias LemonChannels.Telegram.{OffsetStore, PollerLock}
+  alias LemonChannels.Telegram.Delivery
+  alias LemonChannels.Telegram.TriggerMode
+  alias LemonChannels.Telegram.TransportShared
+  alias LemonCore.ChatScope
+  alias LemonCore.ProjectBindingStore
+  alias LemonCore.ResumeToken
+  alias LemonCore.MapHelpers
+  alias LemonCore.SessionKey
+  alias LemonChannels.Adapters.Telegram.Transport.Commands
+  alias LemonChannels.Adapters.Telegram.Transport.CommandRouter
+  alias LemonChannels.Adapters.Telegram.Transport.FileOperations
+  alias LemonChannels.Adapters.Telegram.Transport.MemoryReflection
+  alias LemonChannels.Adapters.Telegram.Transport.MessageBuffer
+  alias LemonChannels.Adapters.Telegram.ModelPolicyAdapter
+  alias LemonChannels.Adapters.Telegram.Transport.Poller
+  alias LemonChannels.Adapters.Telegram.Transport.PerChatState
+  alias LemonChannels.Adapters.Telegram.Transport.ResumeSelection
+  alias LemonChannels.Adapters.Telegram.Transport.SessionRouting
+  alias LemonCore.Config
+  alias LemonCore.Secrets
+
+  @default_poll_interval 1_000
+  @default_dedupe_ttl 600_000
+  @default_debounce_ms 1_000
+  @cancel_callback_prefix "lemon:cancel"
+  @model_callback_prefix "lemon:model"
+  @providers_per_page 8
+  @models_per_page 8
+  @model_default_engine "lemon"
+  @model_picker_prev "<< Prev"
+  @model_picker_next "Next >>"
+  @model_picker_back "< Back"
+  @model_picker_close "Close"
+  @model_picker_scope_session "This session"
+  @model_picker_scope_future "All future sessions"
+  @thinking_levels ~w(off minimal low medium high xhigh)
+  @idle_keepalive_continue_callback_prefix "lemon:idle:c:"
+  @idle_keepalive_stop_callback_prefix "lemon:idle:k:"
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @impl true
+  def init(opts) do
+    base = LemonChannels.GatewayConfig.get(:telegram, %{})
+
+    config =
+      base
+      |> merge_config(Keyword.get(opts, :config))
+      |> merge_config(Keyword.drop(opts, [:config]))
+
+    token = cfg_get(config, :bot_token)
+
+    if is_binary(token) and token != "" do
+      account_id = cfg_get(config, :account_id, "default")
+
+      case PollerLock.acquire(account_id, token) do
+        :ok ->
+          :ok = TransportShared.init_dedupe(:channels)
+
+          config_offset = cfg_get(config, :offset)
+          stored_offset = OffsetStore.get(account_id, token)
+
+          drop_pending_updates = cfg_get(config, :drop_pending_updates, false)
+
+          # If enabled, drop any pending Telegram updates on every boot unless an explicit offset is set.
+          # This prevents the bot from replying to historical messages after downtime.
+          drop_pending_updates = drop_pending_updates && is_nil(config_offset)
+
+          {openai_api_key, openai_base_url} = resolve_openai_provider()
+
+          api_mod = resolve_api_mod(config)
+
+          {bot_id, bot_username} =
+            resolve_bot_identity(
+              cfg_get(config, :bot_id),
+              cfg_get(config, :bot_username),
+              api_mod,
+              token
+            )
+
+          state = %{
+            token: token,
+            api_mod: api_mod,
+            poll_interval_ms: config[:poll_interval_ms] || @default_poll_interval,
+            dedupe_ttl_ms: config[:dedupe_ttl_ms] || @default_dedupe_ttl,
+            debounce_ms: cfg_get(config, :debounce_ms, @default_debounce_ms),
+            # When true, emit debug logs for inbound decisions (drops, routing, etc).
+            debug_inbound: cfg_get(config, :debug_inbound, false),
+            # When true, log drop/ignore reasons even if debug_inbound is false.
+            log_drops: cfg_get(config, :log_drops, false),
+            allow_queue_override: cfg_get(config, :allow_queue_override, false),
+            allowed_chat_ids: parse_allowed_chat_ids(cfg_get(config, :allowed_chat_ids)),
+            deny_unbound_chats: cfg_get(config, :deny_unbound_chats, false),
+            account_id: account_id,
+            voice_transcription: cfg_get(config, :voice_transcription, false),
+            voice_transcription_model:
+              cfg_get(config, :voice_transcription_model, "gpt-4o-mini-transcribe"),
+            voice_transcription_base_url:
+              normalize_blank(cfg_get(config, :voice_transcription_base_url)) || openai_base_url,
+            voice_transcription_api_key:
+              normalize_blank(cfg_get(config, :voice_transcription_api_key)) || openai_api_key,
+            voice_max_bytes: cfg_get(config, :voice_max_bytes, 10 * 1024 * 1024),
+            voice_transcriber:
+              config[:voice_transcriber] || LemonChannels.Adapters.Telegram.VoiceTranscriber,
+            # If we're configured to drop pending updates on boot, start from 0 so we can
+            # advance to the real "latest" update_id even if a stale stored offset is ahead.
+            offset:
+              if(drop_pending_updates, do: 0, else: initial_offset(config_offset, stored_offset)),
+            drop_pending_updates?: drop_pending_updates,
+            drop_pending_done?: false,
+            buffers: %{},
+            media_groups: %{},
+            # run_id => %{session_key, chat_id, thread_id, user_msg_id}
+            pending_new: %{},
+            # run_id => %{chat_id, thread_id, user_msg_id} for reaction tracking
+            reaction_runs: %{},
+            bot_id: bot_id,
+            bot_username: bot_username,
+            files: cfg_get(config, :files, %{}),
+            # {chat_id, thread_id, sender_id} => model picker state
+            model_pickers: %{},
+            last_poll_error: nil,
+            last_poll_error_log_ts: nil,
+            last_webhook_clear_ts: nil
+          }
+
+          maybe_subscribe_exec_approvals()
+          send(self(), :poll)
+          {:ok, state}
+
+        {:error, :locked} ->
+          Logger.warning(
+            "Telegram poller already running for account_id=#{inspect(account_id)}; refusing to start lemon_channels transport"
+          )
+
+          :ignore
+      end
+    else
+      :ignore
+    end
+  end
+
+  @impl true
+  def handle_info(:poll, state) do
+    state = poll_updates(state)
+    Process.send_after(self(), :poll, state.poll_interval_ms)
+    {:noreply, state}
+  end
+
+  # Debounce flush for buffered non-command messages.
+  def handle_info({:debounce_flush, scope_key, debounce_ref}, state) do
+    {buffer, buffers} = Map.pop(state.buffers, scope_key)
+
+    state =
+      cond do
+        buffer && buffer.debounce_ref == debounce_ref ->
+          submit_buffer(buffer, state)
+          %{state | buffers: buffers}
+
+        buffer ->
+          # Stale timer; keep latest buffer.
+          %{state | buffers: Map.put(state.buffers, scope_key, buffer)}
+
+        true ->
+          state
+      end
+
+    {:noreply, state}
+  end
+
+  # Media group flush for Telegram albums of documents.
+  def handle_info({:media_group_flush, group_key, debounce_ref}, state) do
+    {group, media_groups} = Map.pop(state.media_groups, group_key)
+
+    state =
+      cond do
+        group && group.debounce_ref == debounce_ref ->
+          process_media_group(group, state)
+          %{state | media_groups: media_groups}
+
+        group ->
+          # Stale timer; keep latest buffer.
+          %{state | media_groups: Map.put(state.media_groups, group_key, group)}
+
+        true ->
+          state
+      end
+
+    {:noreply, state}
+  rescue
+    _ -> {:noreply, state}
+  end
+
+  # Tool execution approval requests/resolutions are delivered on the `exec_approvals` bus topic.
+  def handle_info(%LemonCore.Event{type: :approval_requested, payload: payload}, state) do
+    _ =
+      start_async_task(state, fn ->
+        maybe_send_approval_request(state, payload)
+      end)
+
+    {:noreply, state}
+  end
+
+  def handle_info(%LemonCore.Event{type: :approval_resolved}, state), do: {:noreply, state}
+
+  # Best-effort second pass to clear chat state in case a late write races with the first delete.
+  def handle_info(
+        {:new_session_cleanup, session_key, chat_id, thread_id},
+        state
+      ) do
+    _ = safe_delete_chat_state(session_key)
+    _ = safe_delete_selected_resume(state, chat_id, thread_id)
+    _ = safe_sweep_thread_message_indices(state, chat_id, thread_id, :all)
+    {:noreply, state}
+  rescue
+    _ -> {:noreply, state}
+  end
+
+  # /new triggers an internal "memory reflection" run; only clear auto-resume after it completes.
+  def handle_info(%LemonCore.Event{type: :run_completed, meta: meta} = event, state) do
+    run_id = (meta || %{})[:run_id] || (meta || %{})["run_id"]
+    session_key = (meta || %{})[:session_key] || (meta || %{})["session_key"]
+
+    # Check if this is a /new command run first
+    state =
+      case run_id && Map.get(state.pending_new, run_id) do
+        %{
+          session_key: sk,
+          chat_id: chat_id,
+          thread_id: thread_id,
+          user_msg_id: user_msg_id
+        } = pending ->
+          _ = safe_delete_chat_state(sk)
+          _ = safe_delete_selected_resume(state, chat_id, thread_id)
+          _ = safe_clear_thread_message_indices(state, chat_id, thread_id)
+
+          # Store writes are async; do a second delete shortly after to win races.
+          Process.send_after(
+            self(),
+            {:new_session_cleanup, sk, chat_id, thread_id},
+            50
+          )
+
+          topic = LemonCore.Bus.run_topic(run_id)
+          _ = LemonCore.Bus.unsubscribe(topic)
+
+          ok? =
+            case event.payload do
+              %{completed: %{ok: ok}} when is_boolean(ok) -> ok
+              %{ok: ok} when is_boolean(ok) -> ok
+              _ -> true
+            end
+
+          msg0 =
+            if ok? do
+              "Started a new session."
+            else
+              "Started a new session (memory recording failed)."
+            end
+
+          scope = %ChatScope{transport: :telegram, chat_id: chat_id, topic_id: thread_id}
+          msg = started_new_session_message(state, scope, sk, pending[:project], msg0)
+
+          _ = send_system_message(state, chat_id, thread_id, user_msg_id, msg)
+
+          %{state | pending_new: Map.delete(state.pending_new, run_id)}
+
+        _ ->
+          state
+      end
+
+    # Handle reaction updates for regular runs
+    state =
+      case session_key && Map.get(state.reaction_runs, session_key) do
+        %{
+          chat_id: chat_id,
+          thread_id: _thread_id,
+          user_msg_id: user_msg_id
+        } = _reaction_run ->
+          ok? =
+            case event.payload do
+              %{completed: %{ok: ok}} when is_boolean(ok) -> ok
+              %{ok: ok} when is_boolean(ok) -> ok
+              _ -> true
+            end
+
+          # Update reaction: ✅ for success, ❌ for failure
+          reaction_emoji = if ok?, do: "✅", else: "❌"
+
+          _ =
+            start_async_task(state, fn ->
+              state.api_mod.set_message_reaction(
+                state.token,
+                chat_id,
+                user_msg_id,
+                reaction_emoji,
+                %{is_big: true}
+              )
+            end)
+
+          # Unsubscribe from session topic and remove from tracking
+          if Code.ensure_loaded?(LemonCore.Bus) and
+               function_exported?(LemonCore.Bus, :unsubscribe, 1) do
+            topic = LemonCore.Bus.session_topic(session_key)
+            _ = LemonCore.Bus.unsubscribe(topic)
+          end
+
+          %{state | reaction_runs: Map.delete(state.reaction_runs, session_key)}
+
+        _ ->
+          state
+      end
+
+    {:noreply, state}
+  rescue
+    _ -> {:noreply, state}
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+
+  @impl true
+  def terminate(_reason, state) do
+    _ = PollerLock.release(state.account_id, state.token)
+    :ok
+  end
+
+  defp poll_updates(state) do
+    Poller.poll_updates(state, %{
+      authorized_callback_query?: &authorized_callback_query?/2,
+      handle_callback_query: &handle_callback_query/2,
+      handle_inbound_message: &handle_inbound_message/2,
+      maybe_transcribe_voice: &maybe_transcribe_voice/2,
+      persist_offset: &persist_offset/2
+    })
+  end
+
+  defp handle_inbound_message(state, inbound) do
+    CommandRouter.handle_inbound_message(state, inbound, %{
+      bot_username: state.bot_username,
+      handle_cwd_command: &handle_cwd_command/2,
+      handle_media_auto_put: &handle_media_auto_put/2,
+      handle_model_command: &handle_model_command/2,
+      handle_new_session: &handle_new_session/3,
+      handle_reload_command: &handle_reload_command/2,
+      handle_resume_command: &handle_resume_command/2,
+      handle_thinking_command: &handle_thinking_command/2,
+      handle_topic_command: &handle_topic_command/2,
+      handle_trigger_command: &handle_trigger_command/2,
+      maybe_apply_selected_resume: &maybe_apply_selected_resume/3,
+      maybe_cancel_by_reply: &maybe_cancel_by_reply/2,
+      maybe_handle_model_picker_input: &maybe_handle_model_picker_input/3,
+      maybe_log_drop: &maybe_log_drop/3,
+      maybe_mark_fork_when_busy: &maybe_mark_fork_when_busy/2,
+      maybe_mark_new_session_pending: &maybe_mark_new_session_pending/2,
+      maybe_switch_session_from_reply: &maybe_switch_session_from_reply/2,
+      should_ignore_for_trigger?: &should_ignore_for_trigger?/3,
+      submit_inbound_now: &submit_inbound_now/2
+    })
+  end
+
+  defp submit_buffer(buffer, state) do
+    MessageBuffer.submit_buffer(buffer, fn inbound ->
+      submit_inbound_now(state, inbound)
+    end)
+  end
+
+  defp submit_inbound_now(state, inbound) do
+    {chat_id, thread_id, user_msg_id} = extract_message_ids(inbound)
+
+    progress_msg_id =
+      if is_integer(chat_id) and is_integer(user_msg_id) do
+        send_progress(state, chat_id, thread_id, user_msg_id)
+      else
+        nil
+      end
+
+    scope =
+      if is_integer(chat_id) do
+        %ChatScope{transport: :telegram, chat_id: chat_id, topic_id: thread_id}
+      else
+        nil
+      end
+
+    meta0 =
+      (inbound.meta || %{})
+      |> Map.put(:progress_msg_id, progress_msg_id)
+      |> Map.put(:user_msg_id, user_msg_id)
+      # Tool status messages are created lazily (only if tools/actions occur).
+      |> Map.put(:status_msg_id, nil)
+      |> Map.put(:topic_id, thread_id)
+      |> Map.put(:thread_generation, current_thread_generation(state, chat_id, thread_id))
+
+    {session_key, forked?} = resolve_session_key(state, inbound, scope, meta0)
+
+    Logger.debug(
+      "Telegram submit inbound chat_id=#{inspect(chat_id)} thread_id=#{inspect(thread_id)} " <>
+        "user_msg_id=#{inspect(user_msg_id)} session_key=#{inspect(session_key)} " <>
+        "forked=#{inspect(forked?)} progress_msg_id=#{inspect(progress_msg_id)}"
+    )
+
+    # Persist engine preference immediately when an explicit directive was used,
+    # so subsequent messages pick it up via last_engine_hint/1.
+    directive_engine = meta0[:directive_engine]
+
+    if is_binary(directive_engine) and directive_engine != "" and is_binary(session_key) do
+      update_chat_state_last_engine(session_key, directive_engine)
+    end
+
+    {model_hint, model_scope} = resolve_model_hint(state, session_key, chat_id, thread_id)
+    {thinking_hint, thinking_scope} = resolve_thinking_hint(state, chat_id, thread_id)
+
+    meta =
+      meta0
+      |> Map.put(:session_key, session_key)
+      |> Map.put(:forked_session, forked?)
+      |> maybe_put(:model, model_hint)
+      |> maybe_put(:model_scope, model_scope)
+      |> maybe_put(:thinking_level, thinking_hint)
+      |> maybe_put(:thinking_scope, thinking_scope)
+
+    meta =
+      if is_binary(model_hint) and model_hint != "" and not is_binary(meta[:engine_id]) do
+        Map.put(meta, :engine_id, @model_default_engine)
+      else
+        meta
+      end
+
+    # Allow reply-to routing into the correct session even while a run is in-flight.
+    _ =
+      maybe_index_telegram_msg_session(state, scope, session_key, [progress_msg_id, user_msg_id])
+
+    # Track this run for reaction updates if we set a progress reaction
+    state =
+      if is_integer(progress_msg_id) and is_binary(session_key) do
+        # Subscribe to session topic to get run completion events
+        maybe_subscribe_to_session(session_key)
+
+        reaction_run = %{
+          chat_id: chat_id,
+          thread_id: thread_id,
+          user_msg_id: user_msg_id,
+          session_key: session_key
+        }
+
+        %{state | reaction_runs: Map.put(state.reaction_runs, session_key, reaction_run)}
+      else
+        state
+      end
+
+    {explicit_resume, stripped_prompt} = extract_explicit_resume_and_strip(inbound.message.text)
+
+    meta =
+      if is_nil(meta[:resume]) and is_nil(meta["resume"]) and
+           match?(%ResumeToken{}, explicit_resume) do
+        Map.put(meta, :resume, explicit_resume)
+      else
+        meta
+      end
+
+    inbound = %{
+      inbound
+      | meta: meta,
+        message: Map.put(inbound.message || %{}, :text, stripped_prompt)
+    }
+
+    route_to_router(inbound)
+    state
+  end
+
+  defp send_progress(state, chat_id, _thread_id, reply_to_message_id) do
+    # Set 👀 reaction on the user's message to indicate we're processing
+    # The reaction is set on reply_to_message_id (the user's message)
+    if is_integer(reply_to_message_id) do
+      case state.api_mod.set_message_reaction(
+             state.token,
+             chat_id,
+             reply_to_message_id,
+             "👀",
+             %{is_big: true}
+           ) do
+        {:ok, %{"ok" => true}} -> reply_to_message_id
+        _ -> nil
+      end
+    else
+      nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  defp maybe_cancel_by_reply(state, inbound) do
+    {chat_id, thread_id} = extract_chat_ids(inbound)
+    reply_to_id = inbound.message.reply_to_id || inbound.meta[:reply_to_id]
+
+    if is_integer(chat_id) and reply_to_id do
+      case Integer.parse(to_string(reply_to_id)) do
+        {progress_msg_id, _} ->
+          scope = %LemonCore.ChatScope{
+            transport: :telegram,
+            chat_id: chat_id,
+            topic_id: thread_id
+          }
+
+          session_key =
+            lookup_session_key_for_reply(state, scope, progress_msg_id) ||
+              build_session_key(state, inbound, scope)
+
+          if Code.ensure_loaded?(LemonChannels.Runtime) and
+               function_exported?(LemonChannels.Runtime, :cancel_by_progress_msg, 2) do
+            LemonChannels.Runtime.cancel_by_progress_msg(session_key, progress_msg_id)
+          end
+
+          :ok
+
+        _ ->
+          :ok
+      end
+    end
+
+    state
+  rescue
+    _ -> state
+  end
+
+  defp extract_explicit_resume_and_strip(text),
+    do: ResumeSelection.extract_explicit_resume_and_strip(text)
+
+  defp process_media_group(group, state) do
+    items = Enum.reverse(group.items || [])
+    first = List.first(items)
+
+    if not is_map(first) do
+      :ok
+    else
+      chat_id = first.meta[:chat_id] || parse_int(first.peer.id)
+      thread_id = parse_int(first.peer.thread_id)
+      user_msg_id = first.meta[:user_msg_id] || parse_int(first.message.id)
+
+      # If any item has a /file put command caption, use that; else auto-put behavior.
+      file_put =
+        Enum.find(items, fn inbound ->
+          txt = inbound.message.text || ""
+
+          Commands.file_command?(txt, state.bot_username) and
+            String.starts_with?(String.trim_leading(txt), "/file") and
+            String.starts_with?(
+              String.trim(Commands.telegram_command_args(txt, "file") || ""),
+              "put"
+            )
+        end)
+
+      if file_put do
+        FileOperations.handle_file_put_media_group(
+          state,
+          file_put,
+          items,
+          chat_id,
+          thread_id,
+          user_msg_id
+        )
+      else
+        FileOperations.handle_auto_put_media_group(state, items, chat_id, thread_id, user_msg_id)
+      end
+    end
+  rescue
+    _ -> :ok
+  end
+
+  # handle_media_auto_put wraps FileOperations but needs access to
+  # GenServer-level helpers (should_ignore_for_trigger?, submit_inbound_now, etc.)
+  defp handle_media_auto_put(state, inbound) do
+    cfg = FileOperations.files_cfg(state)
+    {_chat_id, _thread_id, _user_msg_id} = extract_message_ids(inbound)
+
+    case FileOperations.handle_media_auto_put(state, inbound) do
+      {:ok, final_rel} ->
+        mode = cfg_get(cfg, :auto_put_mode, "upload")
+        caption = String.trim(inbound.message.text || "")
+
+        cond do
+          mode == "prompt" and caption != "" ->
+            prompt = String.trim("#{caption}\n\n[uploaded: #{final_rel}]")
+            inbound = %{inbound | message: Map.put(inbound.message, :text, prompt)}
+
+            if should_ignore_for_trigger?(state, inbound, prompt) do
+              state
+            else
+              {state, inbound} = maybe_switch_session_from_reply(state, inbound)
+              inbound = maybe_apply_selected_resume(state, inbound, prompt)
+              submit_inbound_now(state, inbound)
+            end
+
+          true ->
+            state
+        end
+
+      {:error, _} ->
+        state
+    end
+  rescue
+    _ -> state
+  end
+
+  defp maybe_select_project_for_scope(%ChatScope{} = scope, selector) when is_binary(selector) do
+    sel = String.trim(selector || "")
+
+    cond do
+      sel == "" ->
+        :noop
+
+      looks_like_path?(sel) ->
+        base =
+          case BindingResolver.resolve_cwd(scope) do
+            cwd when is_binary(cwd) and byte_size(cwd) > 0 -> cwd
+            _ -> Cwd.default_cwd()
+          end
+
+        expanded =
+          case Path.type(sel) do
+            :absolute -> Path.expand(sel)
+            :relative -> Path.expand(sel, base)
+            _ -> Path.expand(sel, base)
+          end
+
+        if File.dir?(expanded) do
+          id = Path.basename(expanded)
+          root = expanded
+
+          ProjectBindingStore.put_dynamic(id, %{root: root, default_engine: nil})
+          ProjectBindingStore.put_override(scope, id)
+
+          {:ok, %{id: id, root: root}}
+        else
+          {:error, "Project path does not exist: #{expanded}"}
+        end
+
+      true ->
+        id = sel
+
+        case BindingResolver.lookup_project(id) do
+          %{root: root} when is_binary(root) and byte_size(root) > 0 ->
+            root = Path.expand(root)
+
+            if File.dir?(root) do
+              ProjectBindingStore.put_override(scope, id)
+
+              {:ok, %{id: id, root: root}}
+            else
+              {:error, "Configured project root does not exist: #{root}"}
+            end
+
+          _ ->
+            {:error, "Unknown project: #{id}"}
+        end
+    end
+  rescue
+    _ -> {:error, "Failed to select project."}
+  end
+
+  defp looks_like_path?(s) when is_binary(s) do
+    String.starts_with?(s, "/") or String.starts_with?(s, "~") or String.starts_with?(s, ".") or
+      String.contains?(s, "/")
+  end
+
+  defp maybe_switch_session_from_reply(state, inbound) do
+    ResumeSelection.maybe_switch_session_from_reply(state, inbound, %{
+      extract_chat_ids: &extract_chat_ids/1,
+      extract_message_ids: &extract_message_ids/1,
+      build_session_key: &build_session_key/3,
+      normalize_msg_id: &normalize_msg_id/1,
+      send_system_message: &send_system_message/5,
+      submit_inbound_now: &submit_inbound_now/2
+    })
+  end
+
+  defp handle_resume_command(state, inbound) do
+    state
+    |> MessageBuffer.drop_buffer_for(inbound)
+    |> ResumeSelection.handle_resume_command(inbound, %{
+      extract_chat_ids: &extract_chat_ids/1,
+      extract_message_ids: &extract_message_ids/1,
+      build_session_key: &build_session_key/3,
+      normalize_msg_id: &normalize_msg_id/1,
+      send_system_message: &send_system_message/5,
+      submit_inbound_now: &submit_inbound_now/2
+    })
+  end
+
+  defp handle_new_session(state, inbound, raw_selector) do
+    {chat_id, thread_id, user_msg_id} = extract_message_ids(inbound)
+
+    state = MessageBuffer.drop_buffer_for(state, inbound)
+
+    if not is_integer(chat_id) do
+      state
+    else
+      scope = %ChatScope{transport: :telegram, chat_id: chat_id, topic_id: thread_id}
+      session_key = build_session_key(state, inbound, scope)
+      selector = normalize_selector(raw_selector)
+
+      project_result =
+        case selector do
+          nil -> :noop
+          sel -> maybe_select_project_for_scope(scope, sel)
+        end
+
+      case project_result do
+        {:error, msg} when is_binary(msg) ->
+          _ = send_system_message(state, chat_id, thread_id, user_msg_id, msg)
+          state
+
+        _ ->
+          start_new_session(state, inbound, scope, session_key, project_result,
+            chat_id: chat_id,
+            thread_id: thread_id,
+            user_msg_id: user_msg_id
+          )
+      end
+    end
+  rescue
+    _ -> state
+  end
+
+  defp normalize_selector(raw_selector) when is_binary(raw_selector) do
+    case String.trim(raw_selector) do
+      "" -> nil
+      other -> other
+    end
+  end
+
+  defp normalize_selector(_), do: nil
+
+  defp start_new_session(state, inbound, scope, session_key, project_result, ids) do
+    chat_id = ids[:chat_id]
+    thread_id = ids[:thread_id]
+    user_msg_id = ids[:user_msg_id]
+    project = extract_project_info(project_result)
+
+    {previous_generation, _new_generation} = bump_thread_generation(state, chat_id, thread_id)
+
+    # Clear selected resume immediately so the next inbound after /new cannot
+    # inherit stale auto-resume state while cleanup runs in the background.
+    _ = safe_delete_selected_resume(state, chat_id, thread_id)
+
+    msg =
+      started_new_session_message(
+        state,
+        scope,
+        session_key,
+        project,
+        "Started a new session."
+      )
+
+    _ = send_system_message(state, chat_id, thread_id, user_msg_id, msg)
+
+    _ =
+      start_async_task(state, fn ->
+        run_new_session_background_work(
+          state,
+          inbound,
+          scope,
+          session_key,
+          chat_id,
+          thread_id,
+          user_msg_id,
+          previous_generation
+        )
+      end)
+
+    state
+  end
+
+  defp run_new_session_background_work(
+         state,
+         inbound,
+         %ChatScope{} = scope,
+         session_key,
+         chat_id,
+         thread_id,
+         user_msg_id,
+         previous_generation
+       ) do
+    _ = safe_abort_session(session_key, :new_session)
+    _ = safe_delete_session_model(session_key)
+    _ = safe_delete_chat_state(session_key)
+    _ = safe_delete_selected_resume(state, chat_id, thread_id)
+    _ = safe_sweep_thread_message_indices(state, chat_id, thread_id, previous_generation)
+
+    _ =
+      submit_memory_reflection_before_new(
+        state,
+        inbound,
+        scope,
+        session_key,
+        chat_id,
+        thread_id,
+        user_msg_id
+      )
+
+    # Store writes are async in some flows; repeat the cleanup once to win races.
+    Process.sleep(50)
+    _ = safe_delete_chat_state(session_key)
+    _ = safe_delete_selected_resume(state, chat_id, thread_id)
+    _ = safe_sweep_thread_message_indices(state, chat_id, thread_id, previous_generation)
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp maybe_subscribe_to_session(session_key) when is_binary(session_key) do
+    if Code.ensure_loaded?(LemonCore.Bus) and
+         function_exported?(LemonCore.Bus, :subscribe, 1) do
+      topic = LemonCore.Bus.session_topic(session_key)
+      _ = LemonCore.Bus.subscribe(topic)
+    end
+  end
+
+  defp maybe_subscribe_to_run(run_id) do
+    if Code.ensure_loaded?(LemonCore.Bus) and
+         function_exported?(LemonCore.Bus, :subscribe, 1) do
+      topic = LemonCore.Bus.run_topic(run_id)
+      _ = LemonCore.Bus.subscribe(topic)
+    end
+  end
+
+  defp started_new_session_message(
+         state,
+         %ChatScope{} = scope,
+         session_key,
+         project,
+         base_msg
+       )
+       when is_binary(base_msg) do
+    {model_hint, model_scope} =
+      resolve_model_hint(state, session_key, scope.chat_id, scope.topic_id)
+
+    {provider_hint, model_id} = split_model_hint(model_hint)
+    model_value = if(is_binary(model_id) and model_id != "", do: model_id, else: model_hint)
+    model_line = format_model_line(model_value, model_scope)
+    {thinking_hint, thinking_scope} = resolve_thinking_hint(state, scope.chat_id, scope.topic_id)
+    thinking_line = format_thinking_line(thinking_hint, thinking_scope)
+
+    provider_line =
+      if(is_binary(provider_hint) and provider_hint != "", do: provider_hint, else: "(default)")
+
+    engine_line = resolve_new_session_engine(session_key, model_hint)
+    cwd_line = resolve_new_session_cwd(scope)
+    account_line = state.account_id || "default"
+
+    session_line =
+      if(is_binary(session_key) and session_key != "", do: session_key, else: "(unavailable)")
+
+    [
+      base_msg,
+      "Model: #{model_line}",
+      "Thinking: #{thinking_line}",
+      "Provider: #{provider_line}",
+      "Engine: #{engine_line}",
+      "CWD: #{cwd_line}",
+      "Account: #{account_line}",
+      "Session key: #{session_line}"
+    ]
+    |> maybe_append_project_line(project)
+    |> Enum.join("\n")
+  rescue
+    _ -> base_msg
+  end
+
+  defp started_new_session_message(_state, _scope, _session_key, project, base_msg)
+       when is_binary(base_msg) do
+    [base_msg]
+    |> maybe_append_project_line(project)
+    |> Enum.join("\n")
+  end
+
+  defp split_model_hint(model_hint) when is_binary(model_hint) and model_hint != "" do
+    case String.split(model_hint, ":", parts: 2) do
+      [provider, model_id] when provider != "" and model_id != "" -> {provider, model_id}
+      _ -> {nil, model_hint}
+    end
+  end
+
+  defp split_model_hint(_), do: {nil, nil}
+
+  defp format_model_line(model_value, model_scope)
+       when is_binary(model_value) and model_value != "" do
+    case model_scope do
+      :session -> "#{model_value} (session override)"
+      :future -> "#{model_value} (chat/topic default)"
+      _ -> model_value
+    end
+  end
+
+  defp format_model_line(_model_value, _model_scope), do: "(default)"
+
+  defp resolve_new_session_engine(session_key, model_hint) do
+    cond do
+      is_binary(model_hint) and model_hint != "" ->
+        "#{@model_default_engine} (from model selection)"
+
+      true ->
+        case last_engine_hint(session_key) do
+          engine when is_binary(engine) and engine != "" -> engine
+          _ -> "(default)"
+        end
+    end
+  rescue
+    _ -> "(default)"
+  end
+
+  defp resolve_new_session_cwd(%ChatScope{} = scope) do
+    case BindingResolver.resolve_cwd(scope) do
+      cwd when is_binary(cwd) and cwd != "" ->
+        Path.expand(cwd)
+
+      _ ->
+        case Cwd.default_cwd() do
+          cwd when is_binary(cwd) and cwd != "" -> Path.expand(cwd)
+          _ -> "(not configured)"
+        end
+    end
+  rescue
+    _ -> "(not configured)"
+  end
+
+  defp resolve_new_session_cwd(_), do: "(not configured)"
+
+  defp maybe_append_project_line(lines, %{id: id, root: root})
+       when is_list(lines) and is_binary(id) and is_binary(root) do
+    lines ++ ["Project: #{id} (#{root})"]
+  end
+
+  defp maybe_append_project_line(lines, _project) when is_list(lines), do: lines
+
+  defp extract_project_info({:ok, %{id: id, root: root}}), do: %{id: id, root: root}
+  defp extract_project_info(_), do: nil
+
+  defp submit_memory_reflection_before_new(
+         state,
+         inbound,
+         %ChatScope{} = scope,
+         session_key,
+         chat_id,
+         thread_id,
+         user_msg_id
+       )
+       when is_binary(session_key) do
+    MemoryReflection.submit_before_new(
+      state,
+      inbound,
+      scope,
+      session_key,
+      chat_id,
+      thread_id,
+      user_msg_id,
+      %{
+        maybe_subscribe_to_run: &maybe_subscribe_to_run/1,
+        current_thread_generation: &current_thread_generation/3,
+        maybe_put: &maybe_put/3
+      }
+    )
+  rescue
+    _ -> :skip
+  end
+
+  defp submit_memory_reflection_before_new(
+         _state,
+         _inbound,
+         _scope,
+         _session_key,
+         _chat_id,
+         _thread_id,
+         _user_msg_id
+       ),
+       do: :skip
+
+  defp last_engine_hint(session_key), do: PerChatState.last_engine_hint(session_key)
+
+  defp safe_delete_chat_state(key), do: PerChatState.safe_delete_chat_state(key)
+
+  defp safe_delete_session_model(session_key),
+    do: PerChatState.safe_delete_session_model(session_key)
+
+  defp safe_abort_session(session_key, reason),
+    do: PerChatState.safe_abort_session(session_key, reason)
+
+  defp safe_delete_selected_resume(state, chat_id, thread_id),
+    do:
+      PerChatState.safe_delete_selected_resume(state.account_id || "default", chat_id, thread_id)
+
+  defp safe_clear_thread_message_indices(state, chat_id, thread_id),
+    do:
+      PerChatState.safe_clear_thread_message_indices(
+        state.account_id || "default",
+        chat_id,
+        thread_id
+      )
+
+  defp safe_sweep_thread_message_indices(state, chat_id, thread_id, max_generation),
+    do:
+      PerChatState.safe_sweep_thread_message_indices(
+        state.account_id || "default",
+        chat_id,
+        thread_id,
+        max_generation
+      )
+
+  defp current_thread_generation(state, chat_id, thread_id),
+    do: PerChatState.current_thread_generation(state.account_id || "default", chat_id, thread_id)
+
+  defp bump_thread_generation(state, chat_id, thread_id),
+    do: PerChatState.bump_thread_generation(state.account_id || "default", chat_id, thread_id)
+
+  defp resolve_model_hint(state, session_key, chat_id, thread_id),
+    do:
+      ModelPolicyAdapter.resolve_model_hint(
+        state.account_id || "default",
+        session_key,
+        chat_id,
+        thread_id
+      )
+
+  defp resolve_thinking_hint(state, chat_id, thread_id),
+    do:
+      ModelPolicyAdapter.resolve_thinking_hint(state.account_id || "default", chat_id, thread_id)
+
+  defp format_thinking_line(level, source),
+    do: ModelPolicyAdapter.format_thinking_line(level, source)
+
+  defp session_model_override(session_key),
+    do: ModelPolicyAdapter.session_model_override(session_key)
+
+  defp put_session_model_override(session_key, model),
+    do: ModelPolicyAdapter.put_session_model_override(session_key, model)
+
+  defp default_model_preference(state, chat_id, thread_id),
+    do:
+      ModelPolicyAdapter.default_model_preference(
+        state.account_id || "default",
+        chat_id,
+        thread_id
+      )
+
+  defp put_default_model_preference(state, chat_id, thread_id, model),
+    do:
+      ModelPolicyAdapter.put_default_model_preference(
+        state.account_id || "default",
+        chat_id,
+        thread_id,
+        model
+      )
+
+  defp default_thinking_preference(account_id, chat_id, thread_id),
+    do: ModelPolicyAdapter.default_thinking_preference(account_id, chat_id, thread_id)
+
+  defp put_default_thinking_preference(account_id, chat_id, thread_id, level),
+    do: ModelPolicyAdapter.put_default_thinking_preference(account_id, chat_id, thread_id, level)
+
+  defp clear_default_thinking_preference(account_id, chat_id, thread_id),
+    do: ModelPolicyAdapter.clear_default_thinking_preference(account_id, chat_id, thread_id)
+
+  # Update only last_engine in chat state, preserving last_resume_token and other fields.
+  defp update_chat_state_last_engine(session_key, engine),
+    do: PerChatState.update_chat_state_last_engine(session_key, engine)
+
+  defp build_session_key(state, inbound, %ChatScope{} = scope),
+    do: SessionRouting.build_session_key(state.account_id || "default", inbound, scope)
+
+  defp normalize_msg_id(msg_id), do: SessionRouting.normalize_msg_id(msg_id)
+
+  defp maybe_mark_new_session_pending(state, inbound) do
+    {chat_id, thread_id} = extract_chat_ids(inbound)
+    SessionRouting.maybe_mark_new_session_pending(state.pending_new, chat_id, thread_id, inbound)
+  end
+
+  defp maybe_apply_selected_resume(state, inbound, original_text) do
+    ResumeSelection.maybe_apply_selected_resume(
+      state.account_id || "default",
+      inbound,
+      original_text
+    )
+  end
+
+  # Mark an inbound as eligible for a new parallel session when the base session is busy.
+  #
+  # This is applied before buffering so we can avoid prefixing resume tokens to
+  # auto-forked sessions.
+  defp maybe_mark_fork_when_busy(state, inbound) do
+    {chat_id, thread_id} = extract_chat_ids(inbound)
+
+    SessionRouting.maybe_mark_fork_when_busy(
+      state.account_id || "default",
+      inbound,
+      chat_id,
+      thread_id
+    )
+  end
+
+  defp resolve_session_key(state, inbound, %ChatScope{} = scope, meta0) do
+    SessionRouting.resolve_session_key(
+      state.account_id || "default",
+      inbound,
+      scope,
+      meta0,
+      current_thread_generation(state, scope.chat_id, scope.topic_id)
+    )
+  end
+
+  defp resolve_session_key(_state, _inbound, _scope, meta0) do
+    SessionRouting.resolve_session_key(nil, nil, nil, meta0, 0)
+  end
+
+  defp lookup_session_key_for_reply(state, %ChatScope{} = scope, reply_to_id)
+       when is_integer(reply_to_id) do
+    SessionRouting.lookup_session_key_for_reply(
+      state.account_id || "default",
+      scope,
+      reply_to_id,
+      current_thread_generation(state, scope.chat_id, scope.topic_id)
+    )
+  end
+
+  defp lookup_session_key_for_reply(_state, _scope, _reply_to_id), do: nil
+
+  defp maybe_index_telegram_msg_session(state, %ChatScope{} = scope, session_key, msg_ids),
+    do:
+      SessionRouting.maybe_index_telegram_msg_session(
+        state.account_id || "default",
+        scope,
+        session_key,
+        msg_ids,
+        current_thread_generation(state, scope.chat_id, scope.topic_id)
+      )
+
+  defp send_system_message(state, chat_id, thread_id, reply_to_message_id, text)
+       when is_integer(chat_id) and is_binary(text) do
+    delivery_opts =
+      []
+      |> maybe_put_kw(:account_id, state.account_id || "default")
+      |> maybe_put_kw(:thread_id, thread_id)
+      |> maybe_put_kw(:reply_to_message_id, reply_to_message_id)
+
+    case Delivery.enqueue_send(chat_id, text, delivery_opts) do
+      :ok ->
+        :ok
+
+      {:error, _reason} ->
+        opts =
+          %{}
+          |> maybe_put("reply_to_message_id", reply_to_message_id)
+          |> maybe_put("message_thread_id", thread_id)
+
+        _ = state.api_mod.send_message(state.token, chat_id, text, opts, nil)
+        :ok
+    end
+  rescue
+    _ -> :ok
+  end
+
+  defp resolve_bot_identity(bot_id, bot_username, api_mod, token) do
+    bot_id = parse_int(bot_id) || bot_id
+    bot_username = normalize_bot_username(bot_username)
+    api_mod = normalize_api_mod(api_mod)
+
+    cond do
+      is_integer(bot_id) and is_binary(bot_username) and bot_username != "" ->
+        {bot_id, bot_username}
+
+      Code.ensure_loaded?(api_mod) and function_exported?(api_mod, :get_me, 1) ->
+        case api_mod.get_me(token) do
+          {:ok, %{"ok" => true, "result" => %{"id" => id, "username" => username}}} ->
+            resolved = {parse_int(id) || id, normalize_bot_username(username)}
+            Logger.debug("[Telegram] Bot identity resolved via getMe: #{inspect(resolved)}")
+            resolved
+
+          other ->
+            Logger.warning(
+              "[Telegram] getMe returned unexpected result, bot_id/bot_username will be nil: #{inspect(other)}"
+            )
+
+            {bot_id, bot_username}
+        end
+
+      true ->
+        Logger.warning(
+          "[Telegram] No getMe available and no config bot_id/bot_username; mention detection will be disabled (api_mod=#{inspect(api_mod)})"
+        )
+
+        {bot_id, bot_username}
+    end
+  rescue
+    error ->
+      Logger.error(
+        "[Telegram] resolve_bot_identity crashed: #{inspect(error)}; mention detection will be disabled"
+      )
+
+      {bot_id, bot_username}
+  end
+
+  defp normalize_bot_username(nil), do: nil
+
+  defp normalize_bot_username(username) when is_binary(username) do
+    username
+    |> String.trim()
+    |> String.trim_leading("@")
+  end
+
+  defp should_ignore_for_trigger?(state, inbound, text) do
+    case inbound.peer.kind do
+      :group ->
+        trigger_mode = trigger_mode_for(state, inbound)
+        trigger_mode.mode == :mentions and not explicit_invocation?(state, inbound, text)
+
+      :channel ->
+        trigger_mode = trigger_mode_for(state, inbound)
+        trigger_mode.mode == :mentions and not explicit_invocation?(state, inbound, text)
+
+      _ ->
+        false
+    end
+  rescue
+    _ -> false
+  end
+
+  defp trigger_mode_for(state, inbound) do
+    {chat_id, topic_id} = extract_chat_ids(inbound)
+    account_id = state.account_id || "default"
+
+    if is_integer(chat_id) do
+      TriggerMode.resolve(account_id, chat_id, topic_id)
+    else
+      %{mode: :all, chat_mode: nil, topic_mode: nil, source: :default}
+    end
+  rescue
+    _ -> %{mode: :all, chat_mode: nil, topic_mode: nil, source: :default}
+  end
+
+  defp explicit_invocation?(state, inbound, text) do
+    Commands.command_message_for_bot?(text, state.bot_username) or
+      mention_of_bot?(state, inbound) or
+      reply_to_bot?(state, inbound)
+  rescue
+    _ -> false
+  end
+
+  defp mention_of_bot?(state, inbound) do
+    bot_username = state.bot_username
+    bot_id = state.bot_id
+    message = inbound_message_from_update(inbound.raw)
+    text = message["text"] || message["caption"] || inbound.message.text || ""
+
+    mention_by_username =
+      if is_binary(bot_username) and bot_username != "" do
+        Regex.match?(~r/(?:^|\W)@#{Regex.escape(bot_username)}(?:\b|$)/i, text || "")
+      else
+        false
+      end
+
+    mention_by_id =
+      if is_integer(bot_id) do
+        entities = message_entities(message)
+
+        Enum.any?(entities, fn entity ->
+          case entity do
+            %{"type" => "text_mention", "user" => %{"id" => id}} ->
+              parse_int(id) == bot_id
+
+            _ ->
+              false
+          end
+        end)
+      else
+        false
+      end
+
+    mention_by_username or mention_by_id
+  rescue
+    _ -> false
+  end
+
+  defp reply_to_bot?(state, inbound) do
+    message = inbound_message_from_update(inbound.raw)
+    reply = message["reply_to_message"] || %{}
+    thread_id = message["message_thread_id"]
+
+    cond do
+      reply == %{} ->
+        false
+
+      topic_root_reply?(thread_id, reply) ->
+        false
+
+      is_integer(state.bot_id) and get_in(reply, ["from", "id"]) == state.bot_id ->
+        true
+
+      is_binary(state.bot_username) and state.bot_username != "" ->
+        reply_username = get_in(reply, ["from", "username"])
+
+        is_binary(reply_username) and
+          String.downcase(reply_username) == String.downcase(state.bot_username)
+
+      true ->
+        false
+    end
+  rescue
+    _ -> false
+  end
+
+  defp topic_root_reply?(thread_id, reply) do
+    is_integer(thread_id) and is_map(reply) and reply["message_id"] == thread_id
+  end
+
+  defp inbound_message_from_update(update) when is_map(update) do
+    cond do
+      is_map(update["message"]) -> update["message"]
+      is_map(update["edited_message"]) -> update["edited_message"]
+      is_map(update["channel_post"]) -> update["channel_post"]
+      true -> %{}
+    end
+  end
+
+  defp inbound_message_from_update(_), do: %{}
+
+  defp message_entities(message) when is_map(message) do
+    entities = message["entities"] || message["caption_entities"]
+    if is_list(entities), do: entities, else: []
+  end
+
+  defp message_entities(_), do: []
+
+  defp maybe_handle_model_picker_input(state, inbound, text) do
+    trimmed = String.trim(text || "")
+
+    cond do
+      trimmed == "" ->
+        {state, false}
+
+      Commands.command_message?(trimmed) ->
+        {state, false}
+
+      true ->
+        case model_picker_key(inbound) do
+          nil ->
+            {state, false}
+
+          key ->
+            pickers = state.model_pickers || %{}
+
+            case Map.get(pickers, key) do
+              nil ->
+                {state, false}
+
+              picker ->
+                handle_model_picker_input(state, inbound, key, picker, trimmed)
+            end
+        end
+    end
+  rescue
+    _ -> {state, false}
+  end
+
+  defp handle_model_picker_input(state, inbound, key, picker, input) do
+    {chat_id, thread_id, user_msg_id} = extract_message_ids(inbound)
+    providers = available_model_providers()
+
+    case picker[:step] do
+      :provider ->
+        handle_model_picker_provider_step(
+          state,
+          key,
+          picker,
+          providers,
+          chat_id,
+          thread_id,
+          user_msg_id,
+          input
+        )
+
+      :model ->
+        handle_model_picker_model_step(state, key, picker, chat_id, thread_id, user_msg_id, input)
+
+      :scope ->
+        handle_model_picker_scope_step(state, key, picker, chat_id, thread_id, user_msg_id, input)
+
+      _ ->
+        {drop_model_picker(state, key), false}
+    end
+  end
+
+  defp handle_model_picker_provider_step(
+         state,
+         key,
+         picker,
+         providers,
+         chat_id,
+         thread_id,
+         user_msg_id,
+         input
+       ) do
+    page = picker[:provider_page] || 0
+
+    cond do
+      model_picker_close?(input) ->
+        state = drop_model_picker(state, key)
+
+        _ =
+          send_model_picker_message(
+            state,
+            chat_id,
+            thread_id,
+            user_msg_id,
+            "Model picker closed.",
+            model_picker_remove_markup()
+          )
+
+        {state, true}
+
+      model_picker_prev?(input) ->
+        new_page = max(page - 1, 0)
+        picker = Map.put(picker, :provider_page, new_page)
+        state = put_model_picker(state, key, picker)
+        text = model_picker_overview_text(state, picker, chat_id, thread_id)
+
+        _ =
+          send_model_picker_message(
+            state,
+            chat_id,
+            thread_id,
+            user_msg_id,
+            text,
+            model_provider_reply_markup(providers, new_page)
+          )
+
+        {state, true}
+
+      model_picker_next?(input) ->
+        new_page = min(page + 1, max_page_for(providers, @providers_per_page))
+        picker = Map.put(picker, :provider_page, new_page)
+        state = put_model_picker(state, key, picker)
+        text = model_picker_overview_text(state, picker, chat_id, thread_id)
+
+        _ =
+          send_model_picker_message(
+            state,
+            chat_id,
+            thread_id,
+            user_msg_id,
+            text,
+            model_provider_reply_markup(providers, new_page)
+          )
+
+        {state, true}
+
+      input in providers ->
+        models = models_for_provider(input)
+
+        if models == [] do
+          _ =
+            send_model_picker_message(
+              state,
+              chat_id,
+              thread_id,
+              user_msg_id,
+              "Provider: #{input}\nNo models are currently available.",
+              model_provider_reply_markup(providers, page)
+            )
+
+          {state, true}
+        else
+          picker =
+            picker
+            |> Map.put(:step, :model)
+            |> Map.put(:provider, input)
+            |> Map.put(:model_page, 0)
+
+          state = put_model_picker(state, key, picker)
+
+          _ =
+            send_model_picker_message(
+              state,
+              chat_id,
+              thread_id,
+              user_msg_id,
+              render_provider_models_text(input),
+              model_list_reply_markup(input, models, 0)
+            )
+
+          {state, true}
+        end
+
+      true ->
+        {drop_model_picker(state, key), false}
+    end
+  end
+
+  defp handle_model_picker_model_step(state, key, picker, chat_id, thread_id, user_msg_id, input) do
+    provider = picker[:provider]
+    page = picker[:model_page] || 0
+    models = models_for_provider(provider)
+
+    cond do
+      model_picker_close?(input) ->
+        state = drop_model_picker(state, key)
+
+        _ =
+          send_model_picker_message(
+            state,
+            chat_id,
+            thread_id,
+            user_msg_id,
+            "Model picker closed.",
+            model_picker_remove_markup()
+          )
+
+        {state, true}
+
+      model_picker_back?(input) ->
+        provider_page = picker[:provider_page] || 0
+        providers = available_model_providers()
+
+        picker =
+          picker
+          |> Map.put(:step, :provider)
+          |> Map.put(:provider, nil)
+          |> Map.put(:provider_page, provider_page)
+
+        state = put_model_picker(state, key, picker)
+        text = model_picker_overview_text(state, picker, chat_id, thread_id)
+
+        _ =
+          send_model_picker_message(
+            state,
+            chat_id,
+            thread_id,
+            user_msg_id,
+            text,
+            model_provider_reply_markup(providers, provider_page)
+          )
+
+        {state, true}
+
+      model_picker_prev?(input) ->
+        new_page = max(page - 1, 0)
+        picker = Map.put(picker, :model_page, new_page)
+        state = put_model_picker(state, key, picker)
+
+        _ =
+          send_model_picker_message(
+            state,
+            chat_id,
+            thread_id,
+            user_msg_id,
+            render_provider_models_text(provider),
+            model_list_reply_markup(provider, models, new_page)
+          )
+
+        {state, true}
+
+      model_picker_next?(input) ->
+        new_page = min(page + 1, max_page_for(models, @models_per_page))
+        picker = Map.put(picker, :model_page, new_page)
+        state = put_model_picker(state, key, picker)
+
+        _ =
+          send_model_picker_message(
+            state,
+            chat_id,
+            thread_id,
+            user_msg_id,
+            render_provider_models_text(provider),
+            model_list_reply_markup(provider, models, new_page)
+          )
+
+        {state, true}
+
+      true ->
+        case model_index_by_label(models, input) do
+          nil ->
+            {drop_model_picker(state, key), false}
+
+          index ->
+            case model_at_index(provider, index) do
+              nil ->
+                {drop_model_picker(state, key), false}
+
+              model ->
+                picker =
+                  picker
+                  |> Map.put(:step, :scope)
+                  |> Map.put(:model_index, index)
+                  |> Map.put(:model_page, div(index, @models_per_page))
+
+                state = put_model_picker(state, key, picker)
+
+                _ =
+                  send_model_picker_message(
+                    state,
+                    chat_id,
+                    thread_id,
+                    user_msg_id,
+                    render_model_scope_text(model),
+                    model_scope_reply_markup()
+                  )
+
+                {state, true}
+            end
+        end
+    end
+  end
+
+  defp handle_model_picker_scope_step(state, key, picker, chat_id, thread_id, user_msg_id, input) do
+    provider = picker[:provider]
+    model_page = picker[:model_page] || 0
+
+    cond do
+      model_picker_close?(input) ->
+        state = drop_model_picker(state, key)
+
+        _ =
+          send_model_picker_message(
+            state,
+            chat_id,
+            thread_id,
+            user_msg_id,
+            "Model picker closed.",
+            model_picker_remove_markup()
+          )
+
+        {state, true}
+
+      model_picker_back?(input) ->
+        models = models_for_provider(provider)
+
+        picker =
+          picker
+          |> Map.put(:step, :model)
+          |> Map.put(:model_page, model_page)
+
+        state = put_model_picker(state, key, picker)
+
+        _ =
+          send_model_picker_message(
+            state,
+            chat_id,
+            thread_id,
+            user_msg_id,
+            render_provider_models_text(provider),
+            model_list_reply_markup(provider, models, model_page)
+          )
+
+        {state, true}
+
+      model_picker_scope_session?(input) ->
+        apply_model_picker_selection(
+          state,
+          key,
+          picker,
+          :session,
+          chat_id,
+          thread_id,
+          user_msg_id
+        )
+
+      model_picker_scope_future?(input) ->
+        apply_model_picker_selection(
+          state,
+          key,
+          picker,
+          :future,
+          chat_id,
+          thread_id,
+          user_msg_id
+        )
+
+      true ->
+        {drop_model_picker(state, key), false}
+    end
+  end
+
+  defp apply_model_picker_selection(state, key, picker, scope, chat_id, thread_id, user_msg_id) do
+    provider = picker[:provider]
+    index = picker[:model_index]
+
+    case model_at_index(provider, index) do
+      nil ->
+        {drop_model_picker(state, key), false}
+
+      model ->
+        model_value = model_spec(model)
+        session_key = picker[:session_key]
+
+        _ = put_session_model_override(session_key, model_value)
+
+        if scope == :future do
+          _ = put_default_model_preference(state, chat_id, thread_id, model_value)
+        end
+
+        text =
+          if scope == :future do
+            "Default model set to #{model_label(model)} for all future sessions in this chat."
+          else
+            "Model set to #{model_label(model)} for this session."
+          end
+
+        state = drop_model_picker(state, key)
+
+        _ =
+          send_model_picker_message(
+            state,
+            chat_id,
+            thread_id,
+            user_msg_id,
+            text,
+            model_picker_remove_markup()
+          )
+
+        {state, true}
+    end
+  end
+
+  defp model_picker_overview_text(state, picker, chat_id, thread_id) do
+    session_key = picker[:session_key]
+    current_session_model = session_model_override(session_key)
+    current_future_model = default_model_preference(state, chat_id, thread_id)
+    render_model_picker_text(current_session_model, current_future_model)
+  end
+
+  defp model_picker_key(inbound) do
+    chat_id = inbound.meta[:chat_id] || parse_int(inbound.peer.id)
+    thread_id = parse_int(inbound.peer.thread_id)
+    sender_id = inbound.sender && inbound.sender.id
+
+    if is_integer(chat_id) and is_binary(sender_id) and sender_id != "" do
+      {chat_id, thread_id, sender_id}
+    else
+      nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  defp put_model_picker(state, key, picker) when is_map(picker) do
+    put_in(state, [:model_pickers], Map.put(state.model_pickers || %{}, key, picker))
+  end
+
+  defp drop_model_picker(state, key) do
+    put_in(state, [:model_pickers], Map.delete(state.model_pickers || %{}, key))
+  end
+
+  defp send_model_picker_message(
+         state,
+         chat_id,
+         thread_id,
+         reply_to_message_id,
+         text,
+         reply_markup
+       )
+       when is_integer(chat_id) and is_binary(text) and is_map(reply_markup) do
+    opts =
+      %{}
+      |> maybe_put("reply_to_message_id", reply_to_message_id)
+      |> maybe_put("message_thread_id", thread_id)
+      |> maybe_put("reply_markup", reply_markup)
+
+    _ = state.api_mod.send_message(state.token, chat_id, text, opts, nil)
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp model_provider_reply_markup(providers, page) when is_list(providers) do
+    {slice, has_prev, has_next} = paginate(providers, page, @providers_per_page)
+
+    rows =
+      slice
+      |> Enum.chunk_every(2)
+      |> Enum.map(fn chunk ->
+        Enum.map(chunk, &%{"text" => &1})
+      end)
+      |> maybe_add_reply_pagination_row(has_prev, has_next)
+      |> Kernel.++([[%{"text" => @model_picker_close}]])
+
+    %{
+      "keyboard" => rows,
+      "resize_keyboard" => true,
+      "one_time_keyboard" => true
+    }
+  end
+
+  defp model_list_reply_markup(_provider, models, page) when is_list(models) do
+    indexed = Enum.with_index(models)
+    {slice, has_prev, has_next} = paginate(indexed, page, @models_per_page)
+
+    rows =
+      slice
+      |> Enum.map(fn {model, _idx} -> [%{"text" => model_label(model)}] end)
+      |> maybe_add_reply_pagination_row(has_prev, has_next)
+      |> Kernel.++([[%{"text" => @model_picker_back}, %{"text" => @model_picker_close}]])
+
+    %{
+      "keyboard" => rows,
+      "resize_keyboard" => true,
+      "one_time_keyboard" => true
+    }
+  end
+
+  defp model_scope_reply_markup do
+    %{
+      "keyboard" => [
+        [%{"text" => @model_picker_scope_session}],
+        [%{"text" => @model_picker_scope_future}],
+        [%{"text" => @model_picker_back}, %{"text" => @model_picker_close}]
+      ],
+      "resize_keyboard" => true,
+      "one_time_keyboard" => true
+    }
+  end
+
+  defp model_picker_remove_markup do
+    %{"remove_keyboard" => true}
+  end
+
+  defp maybe_add_reply_pagination_row(rows, has_prev, has_next) do
+    nav =
+      []
+      |> maybe_add_reply_prev(has_prev)
+      |> maybe_add_reply_next(has_next)
+
+    if nav == [] do
+      rows
+    else
+      rows ++ [nav]
+    end
+  end
+
+  defp maybe_add_reply_prev(buttons, true), do: buttons ++ [%{"text" => @model_picker_prev}]
+  defp maybe_add_reply_prev(buttons, _), do: buttons
+
+  defp maybe_add_reply_next(buttons, true), do: buttons ++ [%{"text" => @model_picker_next}]
+  defp maybe_add_reply_next(buttons, _), do: buttons
+
+  defp model_picker_prev?(text), do: picker_text_eq?(text, @model_picker_prev)
+  defp model_picker_next?(text), do: picker_text_eq?(text, @model_picker_next)
+  defp model_picker_back?(text), do: picker_text_eq?(text, @model_picker_back)
+  defp model_picker_close?(text), do: picker_text_eq?(text, @model_picker_close)
+
+  defp model_picker_scope_session?(text), do: picker_text_eq?(text, @model_picker_scope_session)
+  defp model_picker_scope_future?(text), do: picker_text_eq?(text, @model_picker_scope_future)
+
+  defp picker_text_eq?(left, right)
+       when is_binary(left) and is_binary(right) do
+    String.downcase(String.trim(left)) == String.downcase(String.trim(right))
+  end
+
+  defp picker_text_eq?(_left, _right), do: false
+
+  defp model_index_by_label(models, label) when is_list(models) and is_binary(label) do
+    Enum.find_index(models, fn model ->
+      model_label(model) == label
+    end)
+  end
+
+  defp model_index_by_label(_models, _label), do: nil
+
+  defp max_page_for(list, per_page)
+       when is_list(list) and is_integer(per_page) and per_page > 0 do
+    case length(list) do
+      0 -> 0
+      n -> div(n - 1, per_page)
+    end
+  end
+
+  defp handle_model_command(state, inbound) do
+    {chat_id, thread_id, user_msg_id} = extract_message_ids(inbound)
+    state = MessageBuffer.drop_buffer_for(state, inbound)
+
+    if not is_integer(chat_id) do
+      state
+    else
+      providers = available_model_providers()
+
+      session_key =
+        build_session_key(state, inbound, %ChatScope{
+          transport: :telegram,
+          chat_id: chat_id,
+          topic_id: thread_id
+        })
+
+      current_session_model = session_model_override(session_key)
+      current_future_model = default_model_preference(state, chat_id, thread_id)
+
+      text = render_model_picker_text(current_session_model, current_future_model)
+      picker_key = model_picker_key(inbound)
+
+      if providers == [] do
+        _ =
+          send_system_message(
+            state,
+            chat_id,
+            thread_id,
+            user_msg_id,
+            text <> "\n\nNo models available."
+          )
+
+        if picker_key, do: drop_model_picker(state, picker_key), else: state
+      else
+        cond do
+          picker_key ->
+            picker = %{
+              step: :provider,
+              provider_page: 0,
+              provider: nil,
+              model_page: 0,
+              model_index: nil,
+              session_key: session_key
+            }
+
+            state = put_model_picker(state, picker_key, picker)
+
+            _ =
+              send_model_picker_message(
+                state,
+                chat_id,
+                thread_id,
+                user_msg_id,
+                text,
+                model_provider_reply_markup(providers, 0)
+              )
+
+            state
+
+          true ->
+            opts =
+              %{
+                "reply_to_message_id" => user_msg_id,
+                "reply_markup" => model_provider_markup(providers, 0)
+              }
+              |> maybe_put("message_thread_id", thread_id)
+
+            _ = state.api_mod.send_message(state.token, chat_id, text, opts, nil)
+            state
+        end
+      end
+    end
+  rescue
+    _ -> state
+  end
+
+  defp handle_trigger_command(state, inbound) do
+    {chat_id, thread_id, user_msg_id} = extract_message_ids(inbound)
+    args = Commands.telegram_command_args(inbound.message.text, "trigger") || ""
+    arg = String.downcase(String.trim(args || ""))
+    account_id = state.account_id || "default"
+
+    if not is_integer(chat_id) do
+      state
+    else
+      scope = %ChatScope{transport: :telegram, chat_id: chat_id, topic_id: thread_id}
+      ctx = {state, chat_id, thread_id, user_msg_id, account_id, scope, inbound}
+
+      case arg do
+        "" ->
+          current = TriggerMode.resolve(account_id, chat_id, thread_id)
+
+          _ =
+            send_system_message(
+              state,
+              chat_id,
+              thread_id,
+              user_msg_id,
+              render_trigger_mode_status(current)
+            )
+
+          state
+
+        mode when mode in ~w(mentions all) ->
+          apply_trigger_mode(ctx, String.to_existing_atom(mode), mode)
+
+        "clear" ->
+          apply_trigger_clear(ctx)
+
+        _ ->
+          _ =
+            send_system_message(
+              state,
+              chat_id,
+              thread_id,
+              user_msg_id,
+              "Usage: /trigger [mentions|all|clear]"
+            )
+
+          state
+      end
+    end
+  rescue
+    _ -> state
+  end
+
+  defp apply_trigger_mode(
+         {state, chat_id, thread_id, user_msg_id, account_id, scope, inbound},
+         mode_atom,
+         mode_str
+       ) do
+    with true <- trigger_change_allowed?(state, inbound, chat_id),
+         :ok <- TriggerMode.set(scope, account_id, mode_atom) do
+      _ =
+        send_system_message(
+          state,
+          chat_id,
+          thread_id,
+          user_msg_id,
+          render_trigger_mode_set(mode_str, scope)
+        )
+
+      state
+    else
+      false ->
+        _ =
+          send_system_message(
+            state,
+            chat_id,
+            thread_id,
+            user_msg_id,
+            "Trigger mode can only be changed by a group admin."
+          )
+
+        state
+
+      _ ->
+        state
+    end
+  end
+
+  defp apply_trigger_clear({state, chat_id, thread_id, user_msg_id, account_id, _scope, inbound}) do
+    cond do
+      is_nil(thread_id) ->
+        _ =
+          send_system_message(
+            state,
+            chat_id,
+            thread_id,
+            user_msg_id,
+            "No topic override to clear. Use /trigger all or /trigger mentions to set chat defaults."
+          )
+
+        state
+
+      trigger_change_allowed?(state, inbound, chat_id) ->
+        :ok = TriggerMode.clear_topic(account_id, chat_id, thread_id)
+
+        _ =
+          send_system_message(
+            state,
+            chat_id,
+            thread_id,
+            user_msg_id,
+            "Cleared topic trigger override."
+          )
+
+        state
+
+      true ->
+        _ =
+          send_system_message(
+            state,
+            chat_id,
+            thread_id,
+            user_msg_id,
+            "Trigger mode can only be changed by a group admin."
+          )
+
+        state
+    end
+  end
+
+  defp trigger_change_allowed?(state, inbound, chat_id) do
+    case inbound.peer.kind do
+      :group ->
+        sender_id = parse_int(inbound.sender && inbound.sender.id)
+
+        if is_integer(sender_id) do
+          sender_admin?(state, chat_id, sender_id)
+        else
+          false
+        end
+
+      _ ->
+        true
+    end
+  end
+
+  defp sender_admin?(state, chat_id, sender_id) do
+    if function_exported?(state.api_mod, :get_chat_member, 3) do
+      case state.api_mod.get_chat_member(state.token, chat_id, sender_id) do
+        {:ok, %{"ok" => true, "result" => %{"status" => status}}}
+        when status in ["administrator", "creator"] ->
+          true
+
+        _ ->
+          false
+      end
+    else
+      false
+    end
+  rescue
+    _ -> false
+  end
+
+  defp render_trigger_mode_status(%{mode: mode, chat_mode: chat_mode, topic_mode: topic_mode}) do
+    base =
+      case mode do
+        :mentions -> "Trigger mode: mentions-only."
+        _ -> "Trigger mode: all."
+      end
+
+    chat_line =
+      case chat_mode do
+        :mentions -> "Chat default: mentions-only."
+        :all -> "Chat default: all."
+        _ -> "Chat default: all."
+      end
+
+    topic_line =
+      case topic_mode do
+        :mentions -> "Topic override: mentions-only."
+        :all -> "Topic override: all."
+        _ -> "Topic override: none."
+      end
+
+    [base, chat_line, topic_line, "Use /trigger mentions|all|clear."]
+    |> Enum.join("\n")
+  end
+
+  defp render_trigger_mode_set(mode, %ChatScope{topic_id: nil}) do
+    "Trigger mode set to #{mode} for this chat."
+  end
+
+  defp render_trigger_mode_set(mode, %ChatScope{topic_id: _}) do
+    "Trigger mode set to #{mode} for this topic."
+  end
+
+  defp handle_thinking_command(state, inbound) do
+    {chat_id, thread_id, user_msg_id} = extract_message_ids(inbound)
+    args = String.trim(Commands.telegram_command_args(inbound.message.text, "thinking") || "")
+
+    if not is_integer(chat_id) do
+      state
+    else
+      account_id = state.account_id || "default"
+      scope = %ChatScope{transport: :telegram, chat_id: chat_id, topic_id: thread_id}
+
+      case normalize_thinking_command_arg(args) do
+        :status ->
+          _ =
+            send_system_message(
+              state,
+              chat_id,
+              thread_id,
+              user_msg_id,
+              render_thinking_status(state, scope)
+            )
+
+          state
+
+        :clear ->
+          had_override? = clear_default_thinking_preference(account_id, chat_id, thread_id)
+
+          _ =
+            send_system_message(
+              state,
+              chat_id,
+              thread_id,
+              user_msg_id,
+              render_thinking_cleared(scope, had_override?)
+            )
+
+          state
+
+        {:set, level} ->
+          :ok = put_default_thinking_preference(account_id, chat_id, thread_id, level)
+
+          _ =
+            send_system_message(
+              state,
+              chat_id,
+              thread_id,
+              user_msg_id,
+              render_thinking_set(scope, level)
+            )
+
+          state
+
+        :invalid ->
+          _ = send_system_message(state, chat_id, thread_id, user_msg_id, thinking_usage())
+          state
+      end
+    end
+  rescue
+    _ -> state
+  end
+
+  defp handle_reload_command(state, inbound) do
+    {chat_id, thread_id, user_msg_id} = extract_message_ids(inbound)
+
+    if not is_integer(chat_id) do
+      state
+    else
+      _ = send_system_message(state, chat_id, thread_id, user_msg_id, "Recompiling...")
+
+      case IEx.Helpers.recompile() do
+        :ok ->
+          _ =
+            send_system_message(
+              state,
+              chat_id,
+              thread_id,
+              user_msg_id,
+              "Recompile complete."
+            )
+
+        :noop ->
+          _ =
+            send_system_message(
+              state,
+              chat_id,
+              thread_id,
+              user_msg_id,
+              "Nothing to recompile — code is up to date."
+            )
+
+        {:error, _} ->
+          _ =
+            send_system_message(
+              state,
+              chat_id,
+              thread_id,
+              user_msg_id,
+              "Recompile failed — check the build output on the server."
+            )
+      end
+
+      state
+    end
+  rescue
+    _ -> state
+  end
+
+  defp normalize_thinking_command_arg(args) when is_binary(args) do
+    case String.downcase(String.trim(args)) do
+      "" -> :status
+      "clear" -> :clear
+      level when level in @thinking_levels -> {:set, level}
+      _ -> :invalid
+    end
+  end
+
+  defp normalize_thinking_command_arg(_), do: :invalid
+
+  defp render_thinking_status(state, %ChatScope{} = scope) do
+    account_id = state.account_id || "default"
+    chat_id = scope.chat_id
+    topic_id = scope.topic_id
+
+    topic_level =
+      if is_integer(topic_id),
+        do: default_thinking_preference(account_id, chat_id, topic_id),
+        else: nil
+
+    chat_level = default_thinking_preference(account_id, chat_id, nil)
+
+    {effective_level, source} =
+      cond do
+        is_binary(topic_level) and topic_level != "" -> {topic_level, :topic}
+        is_binary(chat_level) and chat_level != "" -> {chat_level, :chat}
+        true -> {nil, nil}
+      end
+
+    scope_label = thinking_scope_label(scope)
+
+    effective_line =
+      "Thinking level for #{scope_label}: #{format_thinking_line(effective_level, source)}"
+
+    chat_line =
+      case chat_level do
+        level when is_binary(level) and level != "" -> "Chat default: #{level}."
+        _ -> "Chat default: none."
+      end
+
+    topic_line =
+      case topic_level do
+        level when is_binary(level) and level != "" -> "Topic override: #{level}."
+        _ -> "Topic override: none."
+      end
+
+    [effective_line, chat_line, topic_line, thinking_usage()]
+    |> Enum.join("\n")
+  rescue
+    _ -> thinking_usage()
+  end
+
+  defp render_thinking_set(%ChatScope{topic_id: topic_id}, level)
+       when is_integer(topic_id) and is_binary(level) do
+    [
+      "Thinking level set to #{level} for this topic.",
+      "New runs in this topic will use this setting.",
+      thinking_usage()
+    ]
+    |> Enum.join("\n")
+  end
+
+  defp render_thinking_set(%ChatScope{}, level) when is_binary(level) do
+    [
+      "Thinking level set to #{level} for this chat.",
+      "New runs in this chat will use this setting.",
+      thinking_usage()
+    ]
+    |> Enum.join("\n")
+  end
+
+  defp render_thinking_set(_scope, level) when is_binary(level),
+    do: "Thinking level set to #{level}."
+
+  defp render_thinking_cleared(%ChatScope{topic_id: topic_id}, had_override?)
+       when is_integer(topic_id) do
+    if had_override? do
+      "Cleared thinking level override for this topic."
+    else
+      "No /thinking override was set for this topic."
+    end
+  end
+
+  defp render_thinking_cleared(%ChatScope{}, had_override?) do
+    if had_override? do
+      "Cleared thinking level override for this chat."
+    else
+      "No /thinking override was set for this chat."
+    end
+  end
+
+  defp render_thinking_cleared(_scope, _had_override?), do: "Thinking level override cleared."
+
+  defp thinking_scope_label(%ChatScope{topic_id: topic_id}) when is_integer(topic_id),
+    do: "this topic"
+
+  defp thinking_scope_label(_), do: "this chat"
+
+  defp thinking_usage, do: "Usage: /thinking [off|minimal|low|medium|high|xhigh|clear]"
+
+  defp handle_cwd_command(state, inbound) do
+    {chat_id, thread_id, user_msg_id} = extract_message_ids(inbound)
+    args = String.trim(Commands.telegram_command_args(inbound.message.text, "cwd") || "")
+
+    if not is_integer(chat_id) do
+      state
+    else
+      scope = %ChatScope{transport: :telegram, chat_id: chat_id, topic_id: thread_id}
+
+      case String.downcase(args) do
+        "" ->
+          _ =
+            send_system_message(
+              state,
+              chat_id,
+              thread_id,
+              user_msg_id,
+              render_cwd_status(scope)
+            )
+
+          state
+
+        "clear" ->
+          had_override? = scope_has_cwd_override?(scope)
+          clear_cwd_override(scope)
+
+          _ =
+            send_system_message(
+              state,
+              chat_id,
+              thread_id,
+              user_msg_id,
+              render_cwd_cleared(scope, had_override?)
+            )
+
+          state
+
+        _ ->
+          case maybe_select_project_for_scope(scope, args) do
+            {:ok, %{root: root}} when is_binary(root) and root != "" ->
+              _ =
+                send_system_message(
+                  state,
+                  chat_id,
+                  thread_id,
+                  user_msg_id,
+                  render_cwd_set(scope, root)
+                )
+
+              state
+
+            {:error, msg} when is_binary(msg) ->
+              _ = send_system_message(state, chat_id, thread_id, user_msg_id, msg)
+              state
+
+            _ ->
+              _ = send_system_message(state, chat_id, thread_id, user_msg_id, cwd_usage())
+              state
+          end
+      end
+    end
+  rescue
+    _ -> state
+  end
+
+  defp render_cwd_status(%ChatScope{} = scope) do
+    cwd = BindingResolver.resolve_cwd(scope)
+    scope_label = cwd_scope_label(scope)
+    override? = scope_has_cwd_override?(scope)
+
+    cond do
+      is_binary(cwd) and cwd != "" and override? ->
+        [
+          "Working directory for #{scope_label}: #{cwd}",
+          "Source: /cwd override.",
+          "New sessions started with /new in #{scope_label} will use this directory.",
+          cwd_usage()
+        ]
+        |> Enum.join("\n")
+
+      is_binary(cwd) and cwd != "" ->
+        [
+          "Working directory for #{scope_label}: #{cwd}",
+          "Source: binding/project configuration.",
+          cwd_usage()
+        ]
+        |> Enum.join("\n")
+
+      true ->
+        [
+          "No working directory configured for #{scope_label}.",
+          "Set one with /cwd <project_id|path>.",
+          cwd_usage()
+        ]
+        |> Enum.join("\n")
+    end
+  rescue
+    _ -> cwd_usage()
+  end
+
+  defp render_cwd_set(scope, root) do
+    scope_label = cwd_scope_label(scope)
+    root = Path.expand(root)
+
+    [
+      "Working directory set for #{scope_label}: #{root}",
+      "New sessions started with /new in #{scope_label} will use this directory.",
+      cwd_usage()
+    ]
+    |> Enum.join("\n")
+  end
+
+  defp render_cwd_cleared(scope, had_override?) do
+    scope_label = cwd_scope_label(scope)
+
+    if had_override? do
+      "Cleared working directory override for #{scope_label}."
+    else
+      "No /cwd override was set for #{scope_label}."
+    end
+  end
+
+  defp cwd_scope_label(%ChatScope{topic_id: topic_id}) when is_integer(topic_id), do: "this topic"
+  defp cwd_scope_label(_), do: "this chat"
+
+  defp scope_has_cwd_override?(%ChatScope{} = scope) do
+    case BindingResolver.get_project_override(scope) do
+      override when is_binary(override) and override != "" -> true
+      _ -> false
+    end
+  rescue
+    _ -> false
+  end
+
+  defp scope_has_cwd_override?(_), do: false
+
+  defp clear_cwd_override(%ChatScope{} = scope) do
+    _ = ProjectBindingStore.delete_override(scope)
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp clear_cwd_override(_), do: :ok
+
+  defp cwd_usage, do: "Usage: /cwd [project_id|path|clear]"
+
+  defp authorized_callback_query?(state, cb) when is_map(cb) do
+    msg = cb["message"] || %{}
+    chat_id = get_in(msg, ["chat", "id"])
+
+    cond do
+      not is_integer(chat_id) ->
+        false
+
+      not allowed_chat?(state.allowed_chat_ids, chat_id) ->
+        false
+
+      state.deny_unbound_chats ->
+        topic_id = msg["message_thread_id"]
+        scope = %ChatScope{transport: :telegram, chat_id: chat_id, topic_id: parse_int(topic_id)}
+        binding_exists?(scope)
+
+      true ->
+        true
+    end
+  rescue
+    _ -> false
+  end
+
+  defp authorized_callback_query?(_state, _cb), do: false
+
+  defp binding_exists?(%ChatScope{} = scope) do
+    case BindingResolver.resolve_binding(scope) do
+      nil -> false
+      _ -> true
+    end
+  rescue
+    _ -> false
+  end
+
+  defp allowed_chat?(nil, _chat_id), do: true
+  defp allowed_chat?(list, chat_id) when is_list(list), do: chat_id in list
+
+  defp parse_allowed_chat_ids(nil), do: nil
+
+  defp parse_allowed_chat_ids(list) when is_list(list) do
+    parsed =
+      list
+      |> Enum.map(&parse_int/1)
+      |> Enum.filter(&is_integer/1)
+
+    if parsed == [], do: [], else: parsed
+  end
+
+  defp parse_allowed_chat_ids(_), do: nil
+
+  defp initial_offset(config_offset, stored_offset) do
+    cond do
+      is_integer(config_offset) -> config_offset
+      is_integer(stored_offset) -> stored_offset
+      true -> 0
+    end
+  end
+
+  defp persist_offset(state, new_offset) do
+    if new_offset != state.offset do
+      OffsetStore.put(state.account_id, state.token, new_offset)
+    end
+
+    :ok
+  end
+
+  defp route_to_router(inbound) do
+    case LemonCore.RouterBridge.handle_inbound(inbound) do
+      :ok ->
+        :ok
+
+      other ->
+        meta = inbound.meta || %{}
+
+        Logger.warning(
+          "RouterBridge.handle_inbound failed for telegram inbound (chat_id=#{inspect(meta[:chat_id])} update_id=#{inspect(meta[:update_id])} msg_id=#{inspect(meta[:user_msg_id])}): " <>
+            inspect(other)
+        )
+
+        # Fallback: emit telemetry for observability
+        LemonCore.Telemetry.channel_inbound("telegram", %{
+          peer_id: inbound.peer.id,
+          peer_kind: inbound.peer.kind
+        })
+    end
+  rescue
+    e ->
+      Logger.warning("Failed to route inbound message: #{inspect(e)}")
+  end
+
+  defp maybe_log_drop(state, inbound, reason) do
+    if state.debug_inbound or state.log_drops do
+      meta = inbound.meta || %{}
+
+      Logger.debug(
+        "Telegram inbound dropped (#{inspect(reason)}) chat_id=#{inspect(meta[:chat_id])} update_id=#{inspect(meta[:update_id])} msg_id=#{inspect(meta[:user_msg_id])} peer=#{inspect(inbound.peer)}"
+      )
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp merge_config(base, nil), do: base
+
+  defp merge_config(base, cfg) when is_map(cfg) do
+    Map.merge(base || %{}, cfg)
+  end
+
+  defp merge_config(base, cfg) when is_list(cfg) do
+    if Keyword.keyword?(cfg) do
+      Map.merge(base || %{}, Enum.into(cfg, %{}))
+    else
+      base || %{}
+    end
+  end
+
+  defp maybe_subscribe_exec_approvals do
+    if Code.ensure_loaded?(LemonCore.Bus) and function_exported?(LemonCore.Bus, :subscribe, 1) do
+      _ = LemonCore.Bus.subscribe("exec_approvals")
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp maybe_send_approval_request(state, payload) when is_map(payload) do
+    approval_id = payload[:approval_id] || payload["approval_id"]
+    pending = payload[:pending] || payload["pending"] || %{}
+    session_key = pending[:session_key] || pending["session_key"]
+
+    with true <- is_binary(approval_id) and is_binary(session_key),
+         %{
+           kind: :channel_peer,
+           channel_id: "telegram",
+           account_id: account_id,
+           peer_id: peer_id,
+           thread_id: thread_id
+         } <-
+           LemonCore.SessionKey.parse(session_key),
+         true <- is_nil(account_id) or account_id == state.account_id,
+         chat_id when is_integer(chat_id) <- parse_int(peer_id) do
+      tool = pending[:tool] || pending["tool"]
+      action = pending[:action] || pending["action"]
+
+      text =
+        "Approval requested: #{tool}\n\n" <>
+          "Action: #{format_action(action)}\n\n" <>
+          "Choose:"
+
+      reply_markup = %{
+        "inline_keyboard" => [
+          [
+            %{"text" => "Approve once", "callback_data" => "#{approval_id}|once"},
+            %{"text" => "Deny", "callback_data" => "#{approval_id}|deny"}
+          ],
+          [
+            %{"text" => "Session", "callback_data" => "#{approval_id}|session"},
+            %{"text" => "Agent", "callback_data" => "#{approval_id}|agent"},
+            %{"text" => "Global", "callback_data" => "#{approval_id}|global"}
+          ]
+        ]
+      }
+
+      topic_id = parse_int(thread_id)
+
+      opts =
+        %{"reply_markup" => reply_markup}
+        |> maybe_put("message_thread_id", topic_id)
+
+      _ = state.api_mod.send_message(state.token, chat_id, text, opts)
+      :ok
+    else
+      _ -> :ok
+    end
+  rescue
+    _ -> :ok
+  end
+
+  defp maybe_send_approval_request(_state, _payload), do: :ok
+
+  defp format_action(action) when is_map(action) do
+    cond do
+      is_binary(action["cmd"]) -> action["cmd"]
+      is_binary(action[:cmd]) -> action[:cmd]
+      true -> inspect(action)
+    end
+  end
+
+  defp format_action(other), do: inspect(other)
+
+  defp handle_callback_query(state, cb) when is_map(cb) do
+    cb_id = cb["id"]
+    data = cb["data"] || ""
+
+    cond do
+      String.starts_with?(data, @idle_keepalive_continue_callback_prefix) ->
+        run_id = String.trim_leading(data, @idle_keepalive_continue_callback_prefix)
+
+        if is_binary(run_id) and run_id != "" and Code.ensure_loaded?(LemonChannels.Runtime) and
+             function_exported?(LemonChannels.Runtime, :keep_run_alive, 2) do
+          LemonChannels.Runtime.keep_run_alive(run_id, :continue)
+        end
+
+        _ = state.api_mod.answer_callback_query(state.token, cb_id, %{"text" => "continuing..."})
+        maybe_close_callback_buttons(state, cb, "Continuing run.")
+        :ok
+
+      String.starts_with?(data, @idle_keepalive_stop_callback_prefix) ->
+        run_id = String.trim_leading(data, @idle_keepalive_stop_callback_prefix)
+
+        if is_binary(run_id) and run_id != "" and Code.ensure_loaded?(LemonChannels.Runtime) and
+             function_exported?(LemonChannels.Runtime, :keep_run_alive, 2) do
+          LemonChannels.Runtime.keep_run_alive(run_id, :cancel)
+        end
+
+        _ = state.api_mod.answer_callback_query(state.token, cb_id, %{"text" => "stopping..."})
+        maybe_close_callback_buttons(state, cb, "Stopping run.")
+        :ok
+
+      String.starts_with?(data, @model_callback_prefix <> ":") ->
+        _ = handle_model_callback_query(state, cb_id, cb, data)
+        :ok
+
+      data == @cancel_callback_prefix ->
+        msg = cb["message"] || %{}
+        chat_id = get_in(msg, ["chat", "id"])
+        topic_id = parse_int(msg["message_thread_id"])
+        message_id = msg["message_id"]
+
+        if is_integer(chat_id) and is_integer(message_id) do
+          scope = %ChatScope{transport: :telegram, chat_id: chat_id, topic_id: topic_id}
+          chat_type = get_in(msg, ["chat", "type"])
+          peer_kind = peer_kind_from_chat_type(chat_type)
+
+          session_key =
+            lookup_session_key_for_reply(state, scope, message_id) ||
+              SessionKey.channel_peer(%{
+                agent_id: BindingResolver.resolve_agent_id(scope) || "default",
+                channel_id: "telegram",
+                account_id: state.account_id || "default",
+                peer_kind: peer_kind,
+                peer_id: to_string(chat_id),
+                thread_id: if(is_integer(topic_id), do: to_string(topic_id), else: nil)
+              })
+
+          if Code.ensure_loaded?(LemonChannels.Runtime) and
+               function_exported?(LemonChannels.Runtime, :cancel_by_progress_msg, 2) do
+            LemonChannels.Runtime.cancel_by_progress_msg(session_key, message_id)
+          end
+        end
+
+        _ = state.api_mod.answer_callback_query(state.token, cb_id, %{"text" => "cancelling..."})
+        :ok
+
+      String.starts_with?(data, @cancel_callback_prefix <> ":") ->
+        run_id = String.trim_leading(data, @cancel_callback_prefix <> ":")
+
+        if is_binary(run_id) and run_id != "" and Code.ensure_loaded?(LemonChannels.Runtime) and
+             function_exported?(LemonChannels.Runtime, :cancel_by_run_id, 2) do
+          LemonChannels.Runtime.cancel_by_run_id(run_id, :user_requested)
+        end
+
+        _ = state.api_mod.answer_callback_query(state.token, cb_id, %{"text" => "cancelling..."})
+        :ok
+
+      true ->
+        {approval_id, decision} = parse_approval_callback(data)
+
+        if is_binary(approval_id) and decision do
+          _ = LemonCore.ExecApprovals.resolve(approval_id, decision)
+
+          _ = state.api_mod.answer_callback_query(state.token, cb_id, %{"text" => "Recorded"})
+
+          msg = cb["message"] || %{}
+          chat_id = get_in(msg, ["chat", "id"])
+          message_id = msg["message_id"]
+
+          if is_integer(chat_id) and is_integer(message_id) do
+            _ =
+              state.api_mod.edit_message_text(
+                state.token,
+                chat_id,
+                message_id,
+                "Approval: #{decision_label(decision)}",
+                %{"reply_markup" => %{"inline_keyboard" => []}}
+              )
+          end
+        else
+          _ = state.api_mod.answer_callback_query(state.token, cb_id, %{"text" => "Unknown"})
+        end
+
+        :ok
+    end
+  rescue
+    _ -> :ok
+  end
+
+  defp handle_callback_query(_state, _cb), do: :ok
+
+  defp handle_model_callback_query(state, cb_id, cb, data) do
+    msg = cb["message"] || %{}
+    chat_id = get_in(msg, ["chat", "id"])
+    message_id = msg["message_id"]
+    topic_id = parse_int(msg["message_thread_id"])
+
+    if not (is_integer(chat_id) and is_integer(message_id)) do
+      state.api_mod.answer_callback_query(state.token, cb_id, %{"text" => "Unknown"})
+    else
+      case parse_model_callback(data) do
+        {:providers, page} ->
+          providers = available_model_providers()
+
+          _ =
+            state.api_mod.edit_message_text(
+              state.token,
+              chat_id,
+              message_id,
+              render_model_picker_text(nil, default_model_preference(state, chat_id, topic_id)),
+              %{"reply_markup" => model_provider_markup(providers, page)}
+            )
+
+          _ = state.api_mod.answer_callback_query(state.token, cb_id, %{"text" => "Updated"})
+
+        {:provider, provider, page} ->
+          case models_for_provider(provider) do
+            [] ->
+              _ =
+                state.api_mod.answer_callback_query(state.token, cb_id, %{"text" => "No models"})
+
+            models ->
+              _ =
+                state.api_mod.edit_message_text(
+                  state.token,
+                  chat_id,
+                  message_id,
+                  render_provider_models_text(provider),
+                  %{"reply_markup" => model_list_markup(provider, models, page)}
+                )
+
+              _ = state.api_mod.answer_callback_query(state.token, cb_id, %{"text" => "Updated"})
+          end
+
+        {:choose, provider, index, page} ->
+          case model_at_index(provider, index) do
+            nil ->
+              _ =
+                state.api_mod.answer_callback_query(state.token, cb_id, %{
+                  "text" => "Unknown model"
+                })
+
+            model ->
+              _ =
+                state.api_mod.edit_message_text(
+                  state.token,
+                  chat_id,
+                  message_id,
+                  render_model_scope_text(model),
+                  %{"reply_markup" => model_scope_markup(provider, index, page)}
+                )
+
+              _ =
+                state.api_mod.answer_callback_query(state.token, cb_id, %{
+                  "text" => "Select scope"
+                })
+          end
+
+        {:set, scope, provider, index} ->
+          case model_at_index(provider, index) do
+            nil ->
+              _ =
+                state.api_mod.answer_callback_query(state.token, cb_id, %{
+                  "text" => "Unknown model"
+                })
+
+            model ->
+              model_spec = model_spec(model)
+              chat_scope = %ChatScope{transport: :telegram, chat_id: chat_id, topic_id: topic_id}
+
+              session_key =
+                SessionKey.channel_peer(%{
+                  agent_id: BindingResolver.resolve_agent_id(chat_scope) || "default",
+                  channel_id: "telegram",
+                  account_id: state.account_id || "default",
+                  peer_kind: peer_kind_from_chat_type(get_in(msg, ["chat", "type"])),
+                  peer_id: to_string(chat_id),
+                  thread_id: if(is_integer(topic_id), do: to_string(topic_id), else: nil)
+                })
+
+              _ = put_session_model_override(session_key, model_spec)
+
+              if scope == :future do
+                _ = put_default_model_preference(state, chat_id, topic_id, model_spec)
+              end
+
+              text =
+                if scope == :future do
+                  "Default model set to #{model_label(model)} for all future sessions in this chat."
+                else
+                  "Model set to #{model_label(model)} for this session."
+                end
+
+              _ =
+                state.api_mod.edit_message_text(
+                  state.token,
+                  chat_id,
+                  message_id,
+                  text,
+                  %{"reply_markup" => %{"inline_keyboard" => []}}
+                )
+
+              _ = state.api_mod.answer_callback_query(state.token, cb_id, %{"text" => "Saved"})
+          end
+
+        :close ->
+          _ =
+            state.api_mod.edit_message_text(
+              state.token,
+              chat_id,
+              message_id,
+              "Model picker closed.",
+              %{"reply_markup" => %{"inline_keyboard" => []}}
+            )
+
+          _ = state.api_mod.answer_callback_query(state.token, cb_id, %{"text" => "Closed"})
+
+        _ ->
+          _ = state.api_mod.answer_callback_query(state.token, cb_id, %{"text" => "Unknown"})
+      end
+    end
+
+    :ok
+  rescue
+    _ ->
+      _ = state.api_mod.answer_callback_query(state.token, cb_id, %{"text" => "Unknown"})
+      :ok
+  end
+
+  defp parse_model_callback(data) when is_binary(data) do
+    prefix = @model_callback_prefix <> ":"
+
+    if String.starts_with?(data, prefix) do
+      rest = String.replace_prefix(data, prefix, "")
+
+      case String.split(rest, ":") do
+        ["providers", page] ->
+          {:providers, max(parse_int(page) || 0, 0)}
+
+        ["provider", provider, page] ->
+          {:provider, provider, max(parse_int(page) || 0, 0)}
+
+        ["choose", provider, index, page] ->
+          {:choose, provider, parse_int(index), max(parse_int(page) || 0, 0)}
+
+        ["set", "s", provider, index] ->
+          {:set, :session, provider, parse_int(index)}
+
+        ["set", "f", provider, index] ->
+          {:set, :future, provider, parse_int(index)}
+
+        ["close"] ->
+          :close
+
+        _ ->
+          nil
+      end
+    else
+      nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  defp parse_model_callback(_), do: nil
+
+  defp render_model_picker_text(session_model, future_model) do
+    session_line = if is_binary(session_model), do: session_model, else: "(not set)"
+    future_line = if is_binary(future_model), do: future_model, else: "(not set)"
+
+    [
+      "Model picker",
+      "",
+      "Session model: #{session_line}",
+      "Future default: #{future_line}",
+      "",
+      "Choose a provider:"
+    ]
+    |> Enum.join("\n")
+  end
+
+  defp render_provider_models_text(provider) when is_binary(provider) do
+    "Provider: #{provider}\nChoose a model:"
+  end
+
+  defp render_model_scope_text(model) do
+    "Selected model: #{model_label(model)}\nApply to:"
+  end
+
+  defp model_provider_markup(providers, page) when is_list(providers) do
+    {slice, has_prev, has_next} = paginate(providers, page, @providers_per_page)
+
+    rows =
+      slice
+      |> Enum.map(fn provider ->
+        [%{"text" => provider, "callback_data" => model_callback_data(:provider, provider, page)}]
+      end)
+      |> maybe_add_pagination_row(has_prev, has_next, page, :providers)
+      |> Kernel.++([[%{"text" => "Close", "callback_data" => model_callback_data(:close)}]])
+
+    %{"inline_keyboard" => rows}
+  end
+
+  defp model_list_markup(provider, models, page) when is_binary(provider) and is_list(models) do
+    indexed = Enum.with_index(models)
+    {slice, has_prev, has_next} = paginate(indexed, page, @models_per_page)
+
+    rows =
+      slice
+      |> Enum.map(fn {model, idx} ->
+        [
+          %{
+            "text" => model_label(model),
+            "callback_data" => model_callback_data(:choose, provider, idx, page)
+          }
+        ]
+      end)
+      |> maybe_add_pagination_row(has_prev, has_next, page, {:provider, provider})
+      |> Kernel.++([
+        [%{"text" => "Back", "callback_data" => model_callback_data(:providers, 0)}],
+        [%{"text" => "Close", "callback_data" => model_callback_data(:close)}]
+      ])
+
+    %{"inline_keyboard" => rows}
+  end
+
+  defp model_scope_markup(provider, index, page)
+       when is_binary(provider) and is_integer(index) and is_integer(page) do
+    %{
+      "inline_keyboard" => [
+        [
+          %{
+            "text" => "This session",
+            "callback_data" => model_callback_data(:set, :session, provider, index)
+          }
+        ],
+        [
+          %{
+            "text" => "All future sessions",
+            "callback_data" => model_callback_data(:set, :future, provider, index)
+          }
+        ],
+        [%{"text" => "Back", "callback_data" => model_callback_data(:provider, provider, page)}],
+        [%{"text" => "Close", "callback_data" => model_callback_data(:close)}]
+      ]
+    }
+  end
+
+  defp model_callback_data(:providers, page), do: "#{@model_callback_prefix}:providers:#{page}"
+
+  defp model_callback_data(:provider, provider, page),
+    do: "#{@model_callback_prefix}:provider:#{provider}:#{page}"
+
+  defp model_callback_data(:choose, provider, index, page),
+    do: "#{@model_callback_prefix}:choose:#{provider}:#{index}:#{page}"
+
+  defp model_callback_data(:set, :session, provider, index),
+    do: "#{@model_callback_prefix}:set:s:#{provider}:#{index}"
+
+  defp model_callback_data(:set, :future, provider, index),
+    do: "#{@model_callback_prefix}:set:f:#{provider}:#{index}"
+
+  defp model_callback_data(:close), do: "#{@model_callback_prefix}:close"
+
+  defp maybe_add_pagination_row(rows, has_prev, has_next, page, kind) do
+    nav =
+      []
+      |> maybe_add_prev_button(has_prev, page, kind)
+      |> maybe_add_next_button(has_next, page, kind)
+
+    if nav == [] do
+      rows
+    else
+      rows ++ [nav]
+    end
+  end
+
+  defp maybe_add_prev_button(buttons, true, page, :providers) do
+    buttons ++
+      [%{"text" => "Prev", "callback_data" => model_callback_data(:providers, max(page - 1, 0))}]
+  end
+
+  defp maybe_add_prev_button(buttons, true, page, {:provider, provider}) do
+    buttons ++
+      [
+        %{
+          "text" => "Prev",
+          "callback_data" => model_callback_data(:provider, provider, max(page - 1, 0))
+        }
+      ]
+  end
+
+  defp maybe_add_prev_button(buttons, _has_prev, _page, _kind), do: buttons
+
+  defp maybe_add_next_button(buttons, true, page, :providers) do
+    buttons ++ [%{"text" => "Next", "callback_data" => model_callback_data(:providers, page + 1)}]
+  end
+
+  defp maybe_add_next_button(buttons, true, page, {:provider, provider}) do
+    buttons ++
+      [%{"text" => "Next", "callback_data" => model_callback_data(:provider, provider, page + 1)}]
+  end
+
+  defp maybe_add_next_button(buttons, _has_next, _page, _kind), do: buttons
+
+  defp paginate(list, page, per_page)
+       when is_list(list) and is_integer(page) and is_integer(per_page) do
+    p = if page < 0, do: 0, else: page
+    start_index = p * per_page
+    total = length(list)
+    slice = list |> Enum.drop(start_index) |> Enum.take(per_page)
+    has_prev = p > 0
+    has_next = start_index + per_page < total
+    {slice, has_prev, has_next}
+  end
+
+  defp available_model_providers do
+    available_model_catalog()
+    |> Enum.map(& &1.provider)
+  end
+
+  defp models_for_provider(provider) when is_binary(provider) do
+    available_model_catalog()
+    |> Enum.find_value([], fn
+      %{provider: ^provider, models: models} -> models
+      _ -> nil
+    end)
+  end
+
+  defp model_at_index(provider, index)
+       when is_binary(provider) and is_integer(index) and index >= 0 do
+    models_for_provider(provider)
+    |> Enum.at(index)
+  end
+
+  defp model_at_index(_provider, _index), do: nil
+
+  defp model_spec(%{provider: provider, id: id}) when is_binary(provider) and is_binary(id) do
+    "#{provider}:#{id}"
+  end
+
+  defp model_spec(_), do: nil
+
+  defp model_label(%{name: name, id: id}) when is_binary(name) and name != "" and is_binary(id) do
+    "#{name} (#{id})"
+  end
+
+  defp model_label(%{id: id}) when is_binary(id), do: id
+  defp model_label(other), do: inspect(other)
+
+  defp available_model_catalog do
+    models_module = :"Elixir.Ai.Models"
+
+    models =
+      if Code.ensure_loaded?(models_module) and function_exported?(models_module, :list_models, 0) do
+        apply(models_module, :list_models, [])
+      else
+        fallback_model_entries()
+      end
+
+    model_maps =
+      models
+      |> Enum.map(&to_model_map/1)
+      |> Enum.filter(&is_map/1)
+
+    filtered =
+      model_maps
+      |> filter_enabled_model_maps()
+      |> maybe_fallback_to_default_providers(model_maps)
+
+    filtered
+    |> Enum.group_by(& &1.provider)
+    |> Enum.map(fn {provider, provider_models} ->
+      %{
+        provider: provider,
+        models:
+          Enum.sort_by(provider_models, fn m ->
+            {String.downcase(m.name || m.id || ""), m.id || ""}
+          end)
+      }
+    end)
+    |> Enum.sort_by(& &1.provider)
+  rescue
+    _ -> fallback_catalog()
+  end
+
+  defp to_model_map(%{provider: provider, id: id} = model) when is_binary(id) do
+    provider_str = provider |> to_string() |> String.downcase()
+    name = Map.get(model, :name) || Map.get(model, "name") || id
+    %{provider: provider_str, id: id, name: name}
+  rescue
+    _ -> nil
+  end
+
+  defp to_model_map(_), do: nil
+
+  defp fallback_model_entries do
+    [
+      %{provider: "anthropic", id: "claude-sonnet-4-20250514", name: "Claude Sonnet 4"},
+      %{provider: "openai", id: "gpt-4o", name: "GPT-4o"},
+      %{provider: "google", id: "gemini-2.5-pro", name: "Gemini 2.5 Pro"}
+    ]
+  end
+
+  defp fallback_catalog do
+    fallback_model_entries()
+    |> Enum.group_by(& &1.provider)
+    |> Enum.map(fn {provider, models} -> %{provider: provider, models: models} end)
+    |> Enum.sort_by(& &1.provider)
+  end
+
+  defp filter_enabled_model_maps(model_maps) when is_list(model_maps) do
+    enabled = enabled_model_provider_names(model_maps)
+
+    Enum.filter(model_maps, fn model ->
+      normalize_provider_name(model.provider) in enabled
+    end)
+  end
+
+  defp maybe_fallback_to_default_providers([], model_maps) when is_list(model_maps) do
+    cfg = Config.cached()
+    defaults = default_provider_hints(cfg)
+
+    Enum.filter(model_maps, fn model ->
+      normalize_provider_name(model.provider) in defaults
+    end)
+  rescue
+    _ -> []
+  end
+
+  defp maybe_fallback_to_default_providers(filtered, _model_maps), do: filtered
+
+  defp enabled_model_provider_names(model_maps) when is_list(model_maps) do
+    cfg = Config.cached()
+    configured = configured_provider_index(cfg)
+    defaults = default_provider_hints(cfg)
+
+    model_maps
+    |> Enum.map(&normalize_provider_name(&1.provider))
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+    |> Enum.filter(fn provider ->
+      provider_enabled?(provider, configured, defaults)
+    end)
+  rescue
+    _ -> []
+  end
+
+  defp configured_provider_index(cfg) do
+    providers = cfg.providers || %{}
+
+    Enum.reduce(providers, %{}, fn {name, provider_cfg}, acc ->
+      Map.put(acc, normalize_provider_name(name), provider_cfg || %{})
+    end)
+  rescue
+    _ -> %{}
+  end
+
+  defp default_provider_hints(cfg) do
+    agent = map_get(cfg, :agent) || %{}
+    provider = map_get(agent, :default_provider)
+    model = map_get(agent, :default_model)
+    {model_provider, _model_id} = split_model_hint(model)
+
+    [provider, model_provider]
+    |> Enum.filter(&(is_binary(&1) and String.trim(&1) != ""))
+    |> Enum.map(&normalize_provider_name/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+  rescue
+    _ -> []
+  end
+
+  defp provider_enabled?(provider, configured, defaults)
+       when is_binary(provider) and is_map(configured) and is_list(defaults) do
+    aliases = provider_aliases(provider)
+
+    Enum.any?(aliases, &Map.has_key?(configured, &1)) or
+      provider_has_credentials?(provider, aliases, configured) or
+      Enum.any?(aliases, &(&1 in defaults)) or
+      provider_special_enabled?(provider)
+  end
+
+  defp provider_enabled?(_provider, _configured, _defaults), do: false
+
+  defp provider_has_credentials?(provider, aliases, configured) do
+    configured_has_value? =
+      Enum.any?(aliases, fn alias_name ->
+        provider_cfg = Map.get(configured, alias_name, %{})
+
+        present_value?(map_get(provider_cfg, :api_key)) or
+          secret_present?(map_get(provider_cfg, :api_key_secret)) or
+          present_value?(map_get(provider_cfg, :base_url))
+      end)
+
+    env_or_store_has_key? =
+      provider_secret_candidates(provider, aliases)
+      |> Enum.any?(&secret_present?/1)
+
+    configured_has_value? or env_or_store_has_key?
+  end
+
+  defp provider_secret_candidates(provider, aliases) do
+    generated =
+      aliases
+      |> Enum.map(&provider_to_env_prefix/1)
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.flat_map(fn prefix ->
+        ["#{prefix}_API_KEY", "#{prefix}_TOKEN"]
+      end)
+
+    explicit =
+      case provider do
+        "anthropic" ->
+          ["ANTHROPIC_API_KEY"]
+
+        "openai" ->
+          ["OPENAI_API_KEY"]
+
+        "openai-codex" ->
+          ["OPENAI_CODEX_API_KEY", "CHATGPT_TOKEN"]
+
+        "opencode" ->
+          ["OPENCODE_API_KEY"]
+
+        "google" ->
+          ["GOOGLE_GENERATIVE_AI_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY"]
+
+        "google-antigravity" ->
+          ["GOOGLE_GENERATIVE_AI_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY"]
+
+        "google-gemini-cli" ->
+          ["GOOGLE_GENERATIVE_AI_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY"]
+
+        "google-vertex" ->
+          ["GOOGLE_APPLICATION_CREDENTIALS"]
+
+        "amazon-bedrock" ->
+          ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE"]
+
+        "kimi" ->
+          ["KIMI_API_KEY", "MOONSHOT_API_KEY"]
+
+        "kimi-coding" ->
+          ["KIMI_API_KEY", "MOONSHOT_API_KEY"]
+
+        "azure-openai-responses" ->
+          ["AZURE_OPENAI_API_KEY"]
+
+        _ ->
+          []
+      end
+
+    (generated ++ explicit)
+    |> Enum.flat_map(fn name -> [name, String.downcase(name)] end)
+    |> Enum.uniq()
+  end
+
+  defp provider_special_enabled?("openai-codex"), do: openai_codex_auth_available?()
+
+  defp provider_special_enabled?("amazon-bedrock") do
+    (secret_present?("AWS_ACCESS_KEY_ID") and secret_present?("AWS_SECRET_ACCESS_KEY")) or
+      secret_present?("AWS_PROFILE")
+  end
+
+  defp provider_special_enabled?(_provider), do: false
+
+  defp provider_aliases(provider) when is_binary(provider) do
+    aliases =
+      case normalize_provider_name(provider) do
+        "google-antigravity" -> [provider, "google"]
+        "google-gemini-cli" -> [provider, "google"]
+        "google-vertex" -> [provider, "google"]
+        "kimi-coding" -> [provider, "kimi"]
+        "amazon-bedrock" -> [provider, "bedrock", "aws"]
+        "azure-openai-responses" -> [provider, "azure-openai", "azure-openai-responses"]
+        "minimax-cn" -> [provider, "minimax"]
+        other -> [other]
+      end
+
+    aliases
+    |> Enum.map(&normalize_provider_name/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+  end
+
+  defp provider_aliases(_provider), do: []
+
+  defp provider_to_env_prefix(provider) when is_binary(provider) do
+    provider
+    |> String.upcase()
+    |> String.replace("-", "_")
+    |> String.replace(~r/[^A-Z0-9_]/, "_")
+    |> String.trim("_")
+  rescue
+    _ -> ""
+  end
+
+  defp provider_to_env_prefix(_provider), do: ""
+
+  defp secret_present?(name) when is_binary(name) and name != "" do
+    present_value?(System.get_env(name)) or
+      present_value?(System.get_env(String.downcase(name))) or
+      Secrets.exists?(name) or
+      Secrets.exists?(String.downcase(name))
+  rescue
+    _ ->
+      present_value?(System.get_env(name)) or
+        present_value?(System.get_env(String.downcase(name)))
+  end
+
+  defp secret_present?(_), do: false
+
+  defp present_value?(value) when is_binary(value), do: String.trim(value) != ""
+  defp present_value?(_), do: false
+
+  defp openai_codex_auth_available? do
+    mod = :"Elixir.Ai.Auth.OpenAICodexOAuth"
+
+    if Code.ensure_loaded?(mod) and function_exported?(mod, :get_api_key, 0) do
+      case apply(mod, :get_api_key, []) do
+        value when is_binary(value) -> String.trim(value) != ""
+        _ -> false
+      end
+    else
+      false
+    end
+  rescue
+    _ -> false
+  end
+
+  defp normalize_provider_name(name) do
+    name
+    |> to_string()
+    |> String.downcase()
+    |> String.replace("_", "-")
+    |> String.trim()
+  rescue
+    _ -> ""
+  end
+
+  defp parse_approval_callback(data) when is_binary(data) do
+    case String.split(data, "|", parts: 2) do
+      [approval_id, "once"] -> {approval_id, :approve_once}
+      [approval_id, "session"] -> {approval_id, :approve_session}
+      [approval_id, "agent"] -> {approval_id, :approve_agent}
+      [approval_id, "global"] -> {approval_id, :approve_global}
+      [approval_id, "deny"] -> {approval_id, :deny}
+      _ -> {nil, nil}
+    end
+  end
+
+  defp decision_label(:approve_once), do: "approve once"
+  defp decision_label(:approve_session), do: "approve session"
+  defp decision_label(:approve_agent), do: "approve agent"
+  defp decision_label(:approve_global), do: "approve global"
+  defp decision_label(:deny), do: "deny"
+  defp decision_label(other), do: inspect(other)
+
+  defp maybe_close_callback_buttons(state, cb, replacement_text) do
+    msg = cb["message"] || %{}
+    chat_id = get_in(msg, ["chat", "id"])
+    message_id = msg["message_id"]
+
+    if is_integer(chat_id) and is_integer(message_id) and is_binary(replacement_text) do
+      _ =
+        state.api_mod.edit_message_text(
+          state.token,
+          chat_id,
+          message_id,
+          replacement_text,
+          %{"reply_markup" => %{"inline_keyboard" => []}}
+        )
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp peer_kind_from_chat_type("private"), do: :dm
+  defp peer_kind_from_chat_type("group"), do: :group
+  defp peer_kind_from_chat_type("supergroup"), do: :group
+  defp peer_kind_from_chat_type("channel"), do: :channel
+  defp peer_kind_from_chat_type(_), do: :unknown
+
+  defp handle_topic_command(state, inbound) do
+    {chat_id, thread_id, user_msg_id} = extract_message_ids(inbound)
+    topic_name = String.trim(Commands.telegram_command_args(inbound.message.text, "topic") || "")
+
+    cond do
+      not is_integer(chat_id) ->
+        state
+
+      topic_name == "" ->
+        _ = send_system_message(state, chat_id, thread_id, user_msg_id, topic_usage())
+        state
+
+      not function_exported?(state.api_mod, :create_forum_topic, 3) ->
+        _ =
+          send_system_message(
+            state,
+            chat_id,
+            thread_id,
+            user_msg_id,
+            "This Telegram API module does not support /topic."
+          )
+
+        state
+
+      true ->
+        case state.api_mod.create_forum_topic(state.token, chat_id, topic_name) do
+          {:ok, %{"ok" => true, "result" => result}} ->
+            _ =
+              send_system_message(
+                state,
+                chat_id,
+                thread_id,
+                user_msg_id,
+                topic_created_message(topic_name, result)
+              )
+
+            state
+
+          {:ok, %{"result" => result}} ->
+            _ =
+              send_system_message(
+                state,
+                chat_id,
+                thread_id,
+                user_msg_id,
+                topic_created_message(topic_name, result)
+              )
+
+            state
+
+          {:ok, %{"description" => description}}
+          when is_binary(description) and description != "" ->
+            _ =
+              send_system_message(
+                state,
+                chat_id,
+                thread_id,
+                user_msg_id,
+                "Failed to create topic: #{description}"
+              )
+
+            state
+
+          {:error, reason} ->
+            _ =
+              send_system_message(
+                state,
+                chat_id,
+                thread_id,
+                user_msg_id,
+                topic_error_message(reason)
+              )
+
+            state
+
+          _ ->
+            _ =
+              send_system_message(
+                state,
+                chat_id,
+                thread_id,
+                user_msg_id,
+                "Failed to create topic."
+              )
+
+            state
+        end
+    end
+  rescue
+    _ -> state
+  end
+
+  defp topic_usage, do: "Usage: /topic <name>"
+
+  defp topic_created_message(topic_name, result) when is_binary(topic_name) and is_map(result) do
+    topic_id = parse_int(result["message_thread_id"] || result[:message_thread_id])
+
+    if is_integer(topic_id) do
+      "Created topic \"#{topic_name}\" (id: #{topic_id})."
+    else
+      "Created topic \"#{topic_name}\"."
+    end
+  rescue
+    _ -> "Created topic \"#{topic_name}\"."
+  end
+
+  defp topic_created_message(topic_name, _result) do
+    "Created topic \"#{topic_name}\"."
+  end
+
+  defp topic_error_message(reason) do
+    case extract_topic_error_description(reason) do
+      desc when is_binary(desc) and desc != "" -> "Failed to create topic: #{desc}"
+      _ -> "Failed to create topic."
+    end
+  end
+
+  defp extract_topic_error_description(%{"description" => desc})
+       when is_binary(desc) and desc != "" do
+    desc
+  end
+
+  defp extract_topic_error_description({:http_error, _status, body}) when is_binary(body) do
+    case Jason.decode(body) do
+      {:ok, %{"description" => desc}} when is_binary(desc) and desc != "" -> desc
+      _ -> nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  defp extract_topic_error_description(_), do: nil
+
+  defp maybe_transcribe_voice(state, inbound) do
+    voice = inbound.meta && inbound.meta[:voice]
+
+    cond do
+      not is_map(voice) or map_size(voice) == 0 ->
+        {:ok, inbound}
+
+      not state.voice_transcription ->
+        if is_binary(inbound.message.text) and inbound.message.text != "" do
+          {:ok, inbound}
+        else
+          _ = maybe_send_voice_error(state, inbound, "Voice transcription is disabled.")
+          {:skip, state}
+        end
+
+      not is_binary(state.voice_transcription_api_key) or state.voice_transcription_api_key == "" ->
+        _ = maybe_send_voice_error(state, inbound, "Voice transcription requires an API key.")
+        {:skip, state}
+
+      true ->
+        case transcribe_voice(state, inbound, voice) do
+          {:ok, transcript} ->
+            message = Map.put(inbound.message, :text, String.trim(transcript || ""))
+            meta = Map.put(inbound.meta || %{}, :voice_transcribed, true)
+            {:ok, %{inbound | message: message, meta: meta}}
+
+          {:error, reason} ->
+            _ = maybe_send_voice_error(state, inbound, format_voice_error(reason))
+            {:skip, state}
+        end
+    end
+  end
+
+  defp transcribe_voice(state, _inbound, voice) do
+    file_id = voice[:file_id] || voice["file_id"]
+    file_size = parse_int(voice[:file_size] || voice["file_size"])
+    max_bytes = parse_int(state.voice_max_bytes)
+
+    if is_integer(max_bytes) and is_integer(file_size) and file_size > max_bytes do
+      {:error, :voice_too_large}
+    else
+      ensure_httpc()
+
+      with {:ok, file_path} <- fetch_voice_file(state, file_id),
+           {:ok, audio_bytes} <- fetch_voice_bytes(state, file_path),
+           :ok <- enforce_voice_size(audio_bytes, max_bytes) do
+        transcriber = state.voice_transcriber
+        mime_type = voice[:mime_type] || voice["mime_type"]
+
+        transcriber.transcribe(%{
+          model: state.voice_transcription_model,
+          base_url: state.voice_transcription_base_url,
+          api_key: state.voice_transcription_api_key,
+          audio_bytes: audio_bytes,
+          mime_type: mime_type
+        })
+      end
+    end
+  end
+
+  defp fetch_voice_file(state, file_id) when is_binary(file_id) do
+    case state.api_mod.get_file(state.token, file_id) do
+      {:ok, %{"ok" => true, "result" => %{"file_path" => file_path}}} when is_binary(file_path) ->
+        {:ok, file_path}
+
+      {:ok, %{"result" => %{"file_path" => file_path}}} when is_binary(file_path) ->
+        {:ok, file_path}
+
+      other ->
+        {:error, {:telegram_file_lookup_failed, other}}
+    end
+  end
+
+  defp fetch_voice_file(_state, _file_id), do: {:error, :missing_file_id}
+
+  defp fetch_voice_bytes(state, file_path) do
+    case state.api_mod.download_file(state.token, file_path) do
+      {:ok, bytes} when is_binary(bytes) -> {:ok, bytes}
+      other -> {:error, {:telegram_download_failed, other}}
+    end
+  end
+
+  defp enforce_voice_size(_bytes, max_bytes) when not is_integer(max_bytes), do: :ok
+
+  defp enforce_voice_size(bytes, max_bytes) when is_binary(bytes) do
+    if byte_size(bytes) > max_bytes do
+      {:error, :voice_too_large}
+    else
+      :ok
+    end
+  end
+
+  defp maybe_send_voice_error(state, inbound, text) when is_binary(text) do
+    {chat_id, thread_id, user_msg_id} = extract_message_ids(inbound)
+
+    if is_integer(chat_id) do
+      send_system_message(state, chat_id, thread_id, user_msg_id, text)
+    else
+      :ok
+    end
+  rescue
+    _ -> :ok
+  end
+
+  defp format_voice_error(:voice_too_large), do: "Voice message is too large to transcribe."
+  defp format_voice_error(:missing_api_key), do: "Voice transcription requires an API key."
+
+  defp format_voice_error({:http_error, status, msg}) do
+    msg =
+      if is_binary(msg) and msg != "" do
+        String.slice(msg, 0, 200)
+      else
+        "request failed"
+      end
+
+    "Voice transcription failed (#{status}): #{msg}"
+  end
+
+  defp format_voice_error({:telegram_file_lookup_failed, _}), do: "Failed to fetch voice file."
+  defp format_voice_error({:telegram_download_failed, _}), do: "Failed to download voice file."
+  defp format_voice_error(other), do: "Voice transcription failed: #{inspect(other)}"
+
+  defp ensure_httpc do
+    _ = Application.ensure_all_started(:inets)
+    _ = Application.ensure_all_started(:ssl)
+    :ok
+  end
+
+  defp resolve_openai_provider do
+    provider =
+      try do
+        cfg = LemonCore.Config.load()
+        providers = cfg.providers || %{}
+        Map.get(providers, "openai") || Map.get(providers, :openai) || %{}
+      rescue
+        _ -> %{}
+      end
+
+    {map_get(provider, :api_key), map_get(provider, :base_url)}
+  end
+
+  defp normalize_blank(nil), do: nil
+  defp normalize_blank(""), do: nil
+  defp normalize_blank(value), do: value
+
+  defp cfg_get(cfg, key, default \\ nil) when is_atom(key) do
+    cfg[key] || cfg[Atom.to_string(key)] || default
+  end
+
+  defp resolve_api_mod(config) do
+    config
+    |> cfg_get(:api_mod, LemonChannels.Telegram.API)
+    |> normalize_api_mod()
+  end
+
+  defp normalize_api_mod(mod) when is_atom(mod), do: mod
+
+  defp normalize_api_mod(""), do: LemonChannels.Telegram.API
+
+  defp normalize_api_mod(mod) when is_binary(mod) do
+    try do
+      module =
+        if String.starts_with?(mod, "Elixir.") do
+          String.to_existing_atom(mod)
+        else
+          String.to_existing_atom("Elixir." <> mod)
+        end
+
+      module
+    rescue
+      _ -> LemonChannels.Telegram.API
+    end
+  end
+
+  defp normalize_api_mod(_), do: LemonChannels.Telegram.API
+
+  defp extract_message_ids(inbound) do
+    chat_id = inbound.meta[:chat_id] || parse_int(inbound.peer.id)
+    thread_id = parse_int(inbound.peer.thread_id)
+    user_msg_id = inbound.meta[:user_msg_id] || parse_int(inbound.message.id)
+    {chat_id, thread_id, user_msg_id}
+  end
+
+  defp extract_chat_ids(inbound) do
+    chat_id = inbound.meta[:chat_id] || parse_int(inbound.peer.id)
+    thread_id = parse_int(inbound.peer.thread_id)
+    {chat_id, thread_id}
+  end
+
+  defp parse_int(nil), do: nil
+
+  defp parse_int(i) when is_integer(i), do: i
+
+  defp parse_int(s) when is_binary(s) do
+    case Integer.parse(s) do
+      {i, _} -> i
+      :error -> nil
+    end
+  end
+
+  defp maybe_put_kw(opts, _key, nil) when is_list(opts), do: opts
+  defp maybe_put_kw(opts, key, value) when is_list(opts), do: [{key, value} | opts]
+
+  defp start_async_task(_state, fun) when is_function(fun, 0) do
+    supervisor = async_supervisor_name()
+
+    if is_pid(Process.whereis(supervisor)) do
+      Task.Supervisor.start_child(supervisor, fn -> run_async_task(fun) end)
+    else
+      Task.start(fn -> run_async_task(fun) end)
+    end
+  rescue
+    _ -> :ok
+  end
+
+  defp start_async_task(_state, _fun), do: :ok
+
+  defp run_async_task(fun) when is_function(fun, 0) do
+    fun.()
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    _kind, _reason -> :ok
+  end
+
+  defp async_supervisor_name, do: LemonChannels.Adapters.Telegram.AsyncSupervisor
+
+  defp map_get(map, key), do: MapHelpers.get_key(map, key)
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+end

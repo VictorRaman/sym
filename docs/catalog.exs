@@ -1,0 +1,254 @@
+[
+  %{
+    path: "docs/README.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-26],
+    max_age_days: 60
+  },
+  %{
+    path: "docs/audiences/for-dummies/README.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-26],
+    max_age_days: 90
+  },
+  %{
+    path: "docs/audiences/for-dummies/01-big-picture.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-26],
+    max_age_days: 90
+  },
+  %{
+    path: "docs/audiences/for-dummies/02-message-journey.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-26],
+    max_age_days: 90
+  },
+  %{
+    path: "docs/audiences/for-dummies/03-the-front-door.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-26],
+    max_age_days: 90
+  },
+  %{
+    path: "docs/audiences/for-dummies/04-the-traffic-cop.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-26],
+    max_age_days: 90
+  },
+  %{
+    path: "docs/audiences/for-dummies/05-the-engine-room.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-26],
+    max_age_days: 90
+  },
+  %{
+    path: "docs/audiences/for-dummies/06-the-agent.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-26],
+    max_age_days: 90
+  },
+  %{
+    path: "docs/audiences/for-dummies/07-talking-to-llms.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-26],
+    max_age_days: 90
+  },
+  %{
+    path: "docs/audiences/for-dummies/08-the-foundation.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-26],
+    max_age_days: 90
+  },
+  %{
+    path: "docs/assistant_bootstrap_contract.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-02-27],
+    max_age_days: 90
+  },
+  %{
+    path: "docs/architecture_boundaries.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-25],
+    max_age_days: 60
+  },
+  %{
+    path: "docs/platform_tiers.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-25],
+    max_age_days: 60
+  },
+  %{
+    path: "docs/beam_agents.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-27],
+    max_age_days: 90
+  },
+  %{
+    path: "docs/benchmarks.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-27],
+    max_age_days: 90
+  },
+  %{
+    path: "docs/config.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-27],
+    max_age_days: 60
+  },
+  %{
+    path: "docs/context.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-27],
+    max_age_days: 90
+  },
+  %{
+    path: "docs/extensions.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-02-27],
+    max_age_days: 60
+  },
+  %{
+    path: "docs/long-running-agent-harnesses.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-02-27],
+    max_age_days: 90
+  },
+  %{
+    path: "docs/model-selection-decoupling.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-02-27],
+    max_age_days: 90
+  },
+  %{
+    path: "docs/mesh_runtime.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-15],
+    max_age_days: 60
+  },
+  %{
+    path: "docs/runtime-hot-reload.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-02-27],
+    max_age_days: 90
+  },
+  %{
+    path: "docs/games-platform.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-01],
+    max_age_days: 90
+  },
+  %{
+    path: "docs/quality_harness.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-27],
+    max_age_days: 60
+  },
+  %{
+    path: "docs/skills.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-27],
+    max_age_days: 90
+  },
+  %{
+    path: "docs/testing/lemonade-stand-stress-test.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-02-27],
+    max_age_days: 30
+  },
+  %{
+    path: "docs/testing/deterministic-test-patterns.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-02-27],
+    max_age_days: 45
+  },
+  %{
+    path: "docs/tools/firecrawl.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-08],
+    max_age_days: 90
+  },
+  %{
+    path: "docs/tools/web.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-08],
+    max_age_days: 90
+  },
+  %{
+    path: "docs/tools/wasm.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-08],
+    max_age_days: 90
+  },
+  %{
+    path: "docs/telemetry.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-02-27],
+    max_age_days: 90
+  },
+  %{
+    path: "docs/security/secrets-keychain-audit-matrix.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-27],
+    max_age_days: 90
+  },
+  %{
+    path: "docs/security/secrets-migration-guide.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-02],
+    max_age_days: 90
+  },
+  %{
+    path: "docs/agent-loop/README.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-02-27],
+    max_age_days: 45
+  },
+  %{
+    path: "docs/agent-loop/GOALS.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-02-27],
+    max_age_days: 45
+  },
+  %{
+    path: "docs/agent-loop/RUN_LOG.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-02-27],
+    max_age_days: 45
+  },
+  %{
+    path: "docs/plans/2026-03-21-mesh-durable-first-and-coding-agent-stabilization.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-21],
+    max_age_days: 60
+  },
+  %{
+    path: "docs/plans/2026-03-26-modular-config-canonicalization.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-26],
+    max_age_days: 90
+  },
+  %{
+    path: "docs/plans/2026-03-26-architecture-refactor-program.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-26],
+    max_age_days: 120
+  },
+  %{
+    path: "docs/roadmap.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-27],
+    max_age_days: 45
+  },
+  %{
+    path: "docs/archive/worklog.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-26],
+    max_age_days: 180
+  },
+  %{
+    path: "docs/archive/reviews/2026-03-26-static-architecture-review.md",
+    owner: "@z80",
+    last_reviewed: ~D[2026-03-26],
+    max_age_days: 365
+  }
+]
